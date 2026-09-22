@@ -1,0 +1,9 @@
+node_modules/
+dist/
+test-results/
+playwright-report/
+artifacts/
+.longrun/
+.sbtmp/
+*.log
+.DS_Store

@@ -1,0 +1,370 @@
+:root {
+  --neon: #2bd7ff;
+  --teal: #25e0c0;
+  --amber: #ff9a3c;
+  --red: #ff4d6d;
+  --bg: #05070d;
+  --panel: rgba(10, 20, 30, 0.82);
+  --line: rgba(43, 215, 255, 0.35);
+  --r-sm: 4px;
+  --r-md: 6px;
+  --r-lg: 10px;
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-6: 24px;
+  /* Accessible text palette — all >= 4.5:1 on the dark panel background */
+  --text-primary: #dcefff;
+  --text-body: #a8c4d8;
+  --text-label: #90b8cc;   /* was #6b8296 (4.2:1 — too low) */
+  --text-muted: #80989e;
+}
+
+/* ── App root + shell animation ───────────────────────────────────────────────── */
+.app-root { position: fixed; inset: 0; overflow: hidden; }
+
+.menu-shell {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 18px; padding: 24px;
+  /* Layered atmospheric backdrop: deep sky, horizon glow, grid depth, scanline */
+  background:
+    repeating-linear-gradient(0deg, rgba(43,215,255,0.04) 0 1px, transparent 1px 4px),
+    repeating-linear-gradient(90deg, rgba(43,215,255,0.06) 0 1px, transparent 1px 72px),
+    radial-gradient(ellipse 800px 280px at 50% 68%, rgba(37,224,192,0.16) 0%, rgba(43,215,255,0.06) 40%, transparent 70%),
+    radial-gradient(ellipse 1200px 600px at 50% -10%, #0e2040 0%, #071220 52%, transparent 100%),
+    linear-gradient(180deg, #04070e 0%, #020508 100%);
+  /* Fade-in on mount: no flash of unstyled or empty content */
+  animation: shell-in 0.38s ease-out both;
+}
+
+@keyframes shell-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .menu-shell, .title-haze, .title-mark { animation: none !important; }
+  .menu-shell { opacity: 1; }
+}
+
+/* ── Title presentation layers ─────────────────────────────────────────────────── */
+/* Haze band: slowly animated atmospheric fog behind the menu (decorative only) */
+.title-haze {
+  position: absolute; left: 0; right: 0; top: 48%; height: 20%;
+  background: linear-gradient(90deg, transparent 0%, rgba(37,224,192,0.10) 28%, rgba(43,215,255,0.14) 52%, transparent 100%);
+  filter: blur(28px);
+  pointer-events: none; z-index: 0;
+  animation: haze-drift 14s ease-in-out infinite alternate;
+}
+@keyframes haze-drift {
+  from { transform: translateX(-5%) scaleX(1.05); opacity: 0.70; }
+  to   { transform: translateX(5%)  scaleX(0.95); opacity: 1.00; }
+}
+
+/* Scanline texture: subtle CRT-like horizontal lines over the whole shell */
+.title-scanlines {
+  position: absolute; inset: 0;
+  background: repeating-linear-gradient(
+    0deg,
+    rgba(0,0,0,0) 0px, rgba(0,0,0,0.06) 1px, rgba(0,0,0,0) 2px
+  );
+  pointer-events: none; z-index: 1;
+  opacity: 0.55;
+}
+
+/* Horizon line: a single decorative rule at the lower third */
+.title-horizon {
+  position: absolute; left: 0; right: 0; top: 68%; height: 1px;
+  background: linear-gradient(90deg, transparent 0%, rgba(43,215,255,0.40) 30%, rgba(37,224,192,0.50) 50%, rgba(43,215,255,0.40) 70%, transparent 100%);
+  pointer-events: none; z-index: 1;
+}
+
+/* Title content sits above the decorative layers */
+.title-content {
+  position: relative; z-index: 2;
+  display: flex; flex-direction: column; align-items: center; gap: 14px;
+  width: 100%;
+}
+
+/* ── Title mark ────────────────────────────────────────────────────────────────── */
+.title-mark {
+  font-size: 52px; font-weight: 800; letter-spacing: 10px;
+  color: var(--neon);
+  text-shadow:
+    0 0 28px rgba(43,215,255,0.72),
+    0 0 56px rgba(43,215,255,0.32),
+    0 2px 0 rgba(5,7,13,0.95);
+  animation: title-glow 5s ease-in-out infinite alternate;
+}
+@keyframes title-glow {
+  from { text-shadow: 0 0 18px rgba(43,215,255,0.50), 0 0 36px rgba(43,215,255,0.18), 0 2px 0 rgba(5,7,13,0.95); }
+  to   { text-shadow: 0 0 36px rgba(43,215,255,0.88), 0 0 72px rgba(43,215,255,0.42), 0 2px 0 rgba(5,7,13,0.95); }
+}
+.title-mark.small { font-size: 26px; letter-spacing: 6px; }
+
+.title-sub {
+  letter-spacing: 6px; color: var(--teal); font-size: 13px;
+  border-bottom: 1px solid rgba(37,224,192,0.30);
+  padding-bottom: 6px;
+  box-shadow: 0 12px 24px -16px rgba(2,8,16,0.90);
+}
+
+.body-text {
+  max-width: 560px; line-height: 1.55;
+  color: var(--text-body);   /* 11:1 against dark backgrounds */
+  text-align: center;
+  padding: 0 20px;
+}
+
+/* ── Buttons ───────────────────────────────────────────────────────────────────── */
+.menu { display: flex; flex-direction: column; gap: var(--sp-2); width: 320px; max-width: calc(100vw - 40px); }
+
+.btn {
+  background: linear-gradient(180deg, rgba(30,50,70,0.90), rgba(12,22,34,0.90));
+  color: var(--text-primary);
+  border: 1px solid var(--line);
+  padding: 12px 18px;
+  border-radius: var(--r-md);
+  cursor: pointer;
+  font-size: 14px; letter-spacing: 1px;
+  transition: transform 0.08s ease, box-shadow 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+  outline: none;
+  /* Size to content: no ellipsis clip. Buttons are laid out with flex:0 0 auto in the HUD so the
+     full label is always visible — a truncated "End Turn (Ent..." is a real defect, not a feature. */
+  white-space: nowrap;
+}
+.btn:hover:not(:disabled) {
+  box-shadow: 0 0 16px rgba(43,215,255,0.45), inset 0 0 8px rgba(43,215,255,0.08);
+  transform: translateY(-1px);
+  border-color: rgba(43,215,255,0.70);
+}
+.btn:active:not(:disabled) { transform: translateY(0); box-shadow: 0 0 8px rgba(43,215,255,0.28); }
+.btn:focus-visible {
+  outline: 2px solid var(--neon);
+  outline-offset: 2px;
+  box-shadow: 0 0 16px rgba(43,215,255,0.58), 0 0 0 4px rgba(43,215,255,0.12);
+}
+.btn:disabled {
+  opacity: 0.32;
+  cursor: not-allowed;
+  border-color: rgba(100,140,170,0.20);
+  color: rgba(130,160,185,0.50);
+  border-style: dashed;
+  transform: none;
+}
+.btn.primary { border-color: var(--teal); color: #eafff8; box-shadow: 0 0 12px rgba(37,224,192,0.25); }
+.btn.small { padding: 6px 10px; font-size: 12px; }
+.btn.sel { background: rgba(37,224,192,0.25); }
+
+.muted { color: var(--text-muted); }
+.settings-bar { display: flex; gap: var(--sp-2); margin-top: var(--sp-2); flex-wrap: wrap; justify-content: center; }
+
+/* ── Game shell ─────────────────────────────────────────────────────────────────── */
+.game-shell { position: absolute; inset: 0; animation: shell-in 0.32s ease-out both; }
+.hud { position: absolute; inset: 0; pointer-events: none; }
+.hud button { pointer-events: auto; }
+.hud button:focus-visible {
+  outline: 2px solid var(--neon);
+  outline-offset: 2px;
+  box-shadow: 0 0 12px rgba(43,215,255,0.55);
+}
+
+/* ── HUD top bar ────────────────────────────────────────────────────────────────── */
+.hud-top {
+  position: absolute; top: var(--sp-3); left: 50%;
+  transform: translateX(-50%);
+  display: flex; gap: var(--sp-2); align-items: center;
+  white-space: nowrap;
+}
+
+.chip {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  padding: 5px 11px;
+  border-radius: var(--r-md);
+  font-size: 12px; letter-spacing: 1px;
+  display: flex; align-items: center; gap: 5px;
+}
+
+/* Phase shape: ▲ player vs ● enemy — shape distinguishes them, not just colour */
+.phase-shape { font-size: 9px; letter-spacing: 0; line-height: 1; }
+.chip.phase.player .phase-shape { color: var(--teal); }
+.chip.phase.enemy  .phase-shape { color: var(--red); }
+.chip.phase.enemy  { border-color: var(--red); color: #ffd0d8; }
+.chip.busy { border-color: var(--amber); }
+
+/* ── HUD left — unit card ───────────────────────────────────────────────────────── */
+.hud-left { position: absolute; top: var(--sp-3); left: var(--sp-3); width: 240px; max-width: calc(50vw - 24px); }
+
+.unit-card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  padding: var(--sp-3);
+  display: flex; flex-direction: column; gap: 5px;
+  overflow: hidden;
+}
+
+.unit-name { font-weight: 700; letter-spacing: 1px; color: #eafff8; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.row-label { font-size: 10px; color: var(--text-label); letter-spacing: 1px; margin-top: 2px; }
+
+.bar { height: 6px; background: rgba(255,255,255,0.09); border-radius: 3px; overflow: hidden; }
+.bar-fill { height: 100%; }
+
+.abilities { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-1); margin-top: 5px; }
+
+.ability {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 6px 9px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: rgba(5,15,25,0.60);
+  cursor: pointer;
+  font-size: 12px; color: var(--text-primary);
+  transition: background 0.12s ease, border-color 0.12s ease;
+  pointer-events: auto;
+  outline: none;
+}
+.ability:hover:not(.off) { background: rgba(43,215,255,0.10); border-color: rgba(43,215,255,0.60); }
+.ability:focus-visible {
+  outline: 2px solid var(--neon); outline-offset: 1px;
+  box-shadow: 0 0 10px rgba(43,215,255,0.50);
+}
+/* Disabled ability: dashed border + reduced opacity — distinguishable without colour alone */
+.ability.off {
+  opacity: 0.32;
+  cursor: not-allowed;
+  border-color: rgba(100,140,170,0.18);
+  border-style: dashed;
+  pointer-events: none;
+}
+
+.ab-cost { color: var(--amber); font-size: 11px; }
+
+.hint {
+  font-size: 11px; color: var(--text-label);  /* 7.5:1 on dark panel */
+  margin-top: 5px; line-height: 1.4;
+}
+
+/* ── HUD right — objectives (shape WITHOUT colour alone) ───────────────────────── */
+.hud-right {
+  position: absolute; top: var(--sp-3); right: var(--sp-3);
+  width: 210px; max-width: calc(50vw - 24px);
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r-lg);
+  padding: var(--sp-3);
+  max-height: calc(100vh - 48px);
+  overflow: hidden;
+}
+
+.obj-title { font-size: 10px; color: var(--teal); letter-spacing: 2px; margin-bottom: 5px; }
+
+.obj { display: flex; align-items: flex-start; gap: 7px; font-size: 12px; margin: 3px 0; }
+
+/*
+  Objective shape indicators (not colour-dependent):
+  locked (default)  = filled circle   — small solid dot
+  available         = open ring       — transparent fill + coloured border
+  done              = square          — border-radius:0 + check mark content
+*/
+.obj-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: rgba(100,130,155,0.55);
+  flex-shrink: 0; margin-top: 2px;
+}
+.obj.available .obj-dot {
+  background: transparent;
+  border: 1.5px solid var(--amber);
+  /* ring shape — differs from both locked (filled circle) and done (square) */
+  box-shadow: 0 0 5px rgba(255,154,60,0.50);
+}
+.obj.done .obj-dot {
+  background: var(--teal);
+  border-radius: 0;   /* square shape */
+  box-shadow: 0 0 5px rgba(37,224,192,0.50);
+}
+/* Check mark inside the done square: shape + content, not colour */
+.obj.done .obj-dot::after {
+  content: "✓";
+  display: block; font-size: 7px; line-height: 8px; text-align: center;
+  color: #020a12; font-weight: 900;
+}
+/* X mark inside the locked circle */
+.obj:not(.available):not(.done) .obj-dot::after {
+  content: "×";
+  display: block; font-size: 6px; line-height: 8px; text-align: center;
+  color: rgba(200,220,240,0.7); font-weight: 900;
+}
+
+.obj-label { flex: 1; color: var(--text-body); line-height: 1.3; }
+.obj-status { font-size: 9px; color: var(--text-label); letter-spacing: 0.5px; white-space: nowrap; flex-shrink: 0; }
+
+.squad-row { display: flex; align-items: center; gap: var(--sp-2); margin: 2px 0; font-size: 12px; }
+.squad-name { width: 80px; flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── HUD bottom bar ─────────────────────────────────────────────────────────────── */
+.hud-bottom {
+  position: absolute; bottom: var(--sp-3); left: 50%;
+  transform: translateX(-50%);
+  display: flex; gap: var(--sp-2); align-items: center;
+  /* Content-sized + centred. The old left:50%+translateX(-50%) auto-width box was shrink-to-fit
+     against only half the viewport (50%→right edge ≈640px at 1280), so the buttons shrank and
+     their nowrap+ellipsis labels clipped to "End Turn (Ent...". width:max-content sizes the row to
+     its content instead, and the buttons below never shrink. */
+  width: max-content; max-width: calc(100vw - 24px);
+}
+.hud-bottom .btn { flex: 0 0 auto; }
+.hud-bottom .cam-hint { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.cam-hint { font-size: 11px; color: var(--text-label); margin-left: var(--sp-2); }
+
+/* ── Overlays and panels ────────────────────────────────────────────────────────── */
+.overlay { position: absolute; inset: 0; display: grid; place-items: center; background: rgba(2,6,12,0.68); }
+.overlay.center { pointer-events: auto; }
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  padding: 22px; border-radius: var(--r-lg);
+  display: flex; flex-direction: column; gap: var(--sp-3); align-items: center;
+  max-width: calc(100vw - 40px);
+  max-height: calc(100vh - 40px);
+  overflow: hidden;
+}
+.score { font-size: 22px; color: var(--amber); letter-spacing: 2px; }
+
+.upgrade-grid { display: flex; gap: 16px; flex-wrap: wrap; justify-content: center; }
+.upgrade-col {
+  display: flex; flex-direction: column; gap: var(--sp-1);
+  width: 170px; background: var(--panel);
+  padding: 10px; border: 1px solid var(--line); border-radius: var(--r-md);
+}
+
+.lb {
+  width: min(460px, calc(100vw - 40px));
+  display: flex; flex-direction: column; gap: 4px;
+  max-height: 50vh; overflow: auto;
+}
+.lb-row {
+  display: flex; gap: 12px; padding: 6px 10px;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--r-sm); font-size: 13px;
+  align-items: center;
+}
+.lb-rank { width: 36px; color: var(--teal); flex-shrink: 0; }
+.lb-score { margin-left: auto; color: var(--amber); }
+
+/* ── Media queries: prevent clipping and overlap ────────────────────────────────── */
+@media (max-width: 1100px) {
+  .hud-left  { width: 200px; }
+  .hud-right { width: 180px; }
+  .squad-name { width: 66px; }
+  .cam-hint { display: none; }
+}
+@media (max-width: 860px) {
+  .hud-left  { width: 170px; }
+  .hud-right { width: 156px; }
+  .squad-name { width: 56px; }
+}

@@ -1,0 +1,32 @@
+{
+  "name": "signal-breach",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/sim",
+    "packages/server",
+    "packages/web"
+  ],
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:unit": "vitest run packages/sim/test",
+    "test:server": "vitest run packages/server/test",
+    "build": "npm run build -w @sb/web",
+    "serve": "npm run start -w @sb/server",
+    "e2e": "playwright test",
+    "verify": "bash scripts/verify-all.sh"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.6.0",
+    "tsx": "^4.19.0",
+    "vitest": "^2.1.0",
+    "@playwright/test": "^1.63.0",
+    "vite": "^5.4.0"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true,
+    "esbuild@0.21.5": true
+  }
+}
