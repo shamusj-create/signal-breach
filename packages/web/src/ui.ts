@@ -25,6 +25,9 @@ export const initialSnapshot: Snapshot = {
   victory: false,
   enemyBusy: false,
   feed: [],
+  pending: null,
+  preview: null,
+  notice: null,
 };
 
 export const ui = {

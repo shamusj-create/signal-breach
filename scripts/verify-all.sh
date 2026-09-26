@@ -3,10 +3,13 @@
 # source and reports a PASS/FAIL summary. Used by CI and the acceptance contract.
 #
 # The browser suite is split into two SEQUENTIAL lanes over the SAME full test set (a partition,
-# not a subset): every one of the 97 Playwright tests runs, exactly once. Nothing is skipped,
-# removed, marked fixme, given a raised timeout or weakened assertion — only WHICH INVOCATION
-# runs each test changed. Lane A runs the heavy 3D journeys at workers=1 so none contend; lane B
-# runs everything else at workers=2 AFTER lane A has fully finished. The two lanes share one
+# not a subset): every Playwright test (the original suite plus the new action-clarity specs) runs
+# exactly once. Nothing is skipped, removed, marked fixme, given a raised timeout or weakened
+# assertion — only WHICH INVOCATION runs each test changed. Lane A runs the heavy 3D journeys at
+# workers=1 so none contend; lane B runs everything else at workers=4 AFTER lane A has fully
+# finished. The parallel lane was raised from 2 to 4 so the four new action-clarity specs keep the
+# whole gate inside its 900 s budget (workers=6 contended and flaked the timing-sensitive visual
+# specs; workers=4 measured green and ~160 s faster). The two lanes share one
 # server pair (lane B reuses lane A's servers). A failure in either lane fails the gate.
 set -u
 cd "$(dirname "$0")/.."
@@ -54,9 +57,9 @@ note "browser lane A — heavy specs, workers=1"
 npx playwright test --project=heavy --workers=1; A=$?
 if [ "$A" -eq 0 ]; then echo "PASS e2e laneA"; else echo "FAIL e2e laneA (exit $A)"; FAIL=1; fi
 
-# LANE B — everything else, workers=2. Runs only after lane A has fully finished.
-note "browser lane B — remaining specs, workers=2"
-npx playwright test --project=rest --workers=2; B=$?
+# LANE B — everything else, workers=4 (parallel). Runs only after lane A has fully finished.
+note "browser lane B — remaining specs, workers=4"
+npx playwright test --project=rest --workers=4; B=$?
 if [ "$B" -eq 0 ]; then echo "PASS e2e laneB"; else echo "FAIL e2e laneB (exit $B)"; FAIL=1; fi
 
 kill "$SRV" "$VIT" >/dev/null 2>&1 || true

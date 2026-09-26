@@ -80,6 +80,8 @@ export function HUD() {
                     className={`ability ${usable ? "" : "off"}`}
                     disabled={!usable}
                     onClick={() => game?.abilityByIndex(i)}
+                    onMouseEnter={() => game?.hoverAbility(i)}
+                    onMouseLeave={() => game?.unhoverAbility()}
                     data-testid={`ability-${i}`}
                     data-hint={hint}
                     aria-label={`${cap.label}, ${cap.cost} energy, range ${cap.range}. ${def?.desc ?? ""}`}
@@ -92,6 +94,30 @@ export function HUD() {
               })}
             </div>
             <div className="hint">Tap a target to shoot · tap ground to move · click a squad row to switch · End Turn below.</div>
+            {snap.pending && (
+              <div className="action-bar pending" data-testid="pending-action" data-hint={snap.pending.label + " is armed — pick a highlighted target to commit it."}>
+                <span className="ab-line" data-testid="pending-text">
+                  {snap.pending.label} armed — pick a highlighted target to commit, or cancel.
+                </span>
+                <button className="btn small pending-cancel" data-testid="pending-cancel" onClick={() => game?.cancelArmed()}>
+                  Cancel
+                </button>
+              </div>
+            )}
+            {snap.preview && (
+              <div className="action-bar preview" data-testid="action-preview">
+                <span className="ab-line" data-testid="preview-text">
+                  {snap.preview.text}
+                </span>
+              </div>
+            )}
+            {snap.notice && (
+              <div className="action-bar notice" data-testid="action-notice">
+                <span className="ab-line" data-testid="notice-text">
+                  {snap.notice.text}
+                </span>
+              </div>
+            )}
           </div>
         ) : (
           <div className="unit-card">

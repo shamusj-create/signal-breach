@@ -33,4 +33,12 @@ export interface Snapshot {
   victory: boolean;
   enemyBusy: boolean;
   feed: { seq: number; text: string }[];
+  // Player-facing action clarity surfaces (presentation only; derived from authoritative state,
+  // never a rule source). `pending` = an armed targeted action awaiting a target; `preview` = the
+  // projected outcome of hovering the current tile (derived from the shared sim so it can be checked
+  // against the delivered result); `notice` = a visible explanation of a refusal / system change so no
+  // board mutation or denied action is ever left unexplained.
+  pending: { ability: string; label: string; keys: string[] } | null;
+  preview: { kind: "attack" | "move" | "support" | "device"; tile: string; text: string } | null;
+  notice: { seq: number; text: string } | null;
 }

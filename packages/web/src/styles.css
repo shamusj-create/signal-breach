@@ -249,6 +249,19 @@
   margin-top: 5px; line-height: 1.4;
 }
 
+/* ── Action-clarity bars (pending / preview / notice). Text WRAPS so it can never force the
+   left panel into horizontal overflow, and every colour clears 4.5:1 on its own background. ── */
+.action-bar {
+  margin-top: 6px; padding: 6px 8px; border-radius: 6px;
+  font-size: 11px; line-height: 1.35;
+  white-space: normal; overflow-wrap: anywhere;
+}
+.action-bar .ab-line { display: block; }
+.action-bar button { margin-top: 5px; }
+.action-bar.pending { background: #3a1d07; color: #ffd8b0; border: 1px solid #7a3c12; }
+.action-bar.preview { background: #082733; color: #d3f6ff; border: 1px solid #1b5666; }
+.action-bar.notice  { background: #2a0e14; color: #ffccd5; border: 1px solid #7a1f2e; }
+
 /* ── HUD right — objectives (shape WITHOUT colour alone) ───────────────────────── */
 .hud-right {
   position: absolute; top: var(--sp-3); right: var(--sp-3);

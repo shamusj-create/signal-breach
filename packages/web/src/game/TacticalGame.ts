@@ -15,6 +15,7 @@ import { World } from "../scene/World.ts";
 import { Store, type Snapshot } from "./serialize.ts";
 import { playSfx, playVoice } from "../audio.ts";
 import { legalTargetsFor } from "./targeting.ts";
+import { deviceKindName } from "../guidance.ts";
 
 export type SnapshotStore = Store<Snapshot>;
 
@@ -72,6 +73,13 @@ export class TacticalGame {
   // read back from it. Capped so the scrollback is bounded but still lets a player read back.
   feed: { seq: number; text: string }[] = [];
   private feedSeq = 0;
+  // Presentation-only clarity surfaces. `previewLine` is the projected outcome of the tile currently
+  // under the cursor (derived from the shared sim so it can be checked against the delivered result);
+  // `notice` is a visible explanation of a refusal or denied action. Neither is a rule source.
+  previewLine: { kind: "attack" | "move" | "support" | "device"; tile: string; text: string } | null = null;
+  private previewTileKey: string | null = null;
+  notice: { seq: number; text: string } | null = null;
+  private noticeSeq = 0;
 
   constructor(_container: HTMLElement, world: World, store: SnapshotStore, missionIndex: number, seed: number) {
     this.world = world;
@@ -110,6 +118,15 @@ export class TacticalGame {
       victory: s.victory,
       enemyBusy: false,
       feed: this.feed.slice(-160),
+      pending: this.armed
+        ? {
+            ability: this.armed.ability,
+            label: ABILITIES[this.armed.ability as keyof typeof ABILITIES]?.label ?? this.armed.ability,
+            keys: [...this.armed.keys],
+          }
+        : null,
+      preview: this.previewLine ? { ...this.previewLine } : null,
+      notice: this.notice ? { seq: this.notice.seq, text: this.notice.text } : null,
     };
   }
 
@@ -271,7 +288,14 @@ private act(action: PlayerAction) {
   private clearAbilityHighlight(): void {
     this.preview = null;
     this.armed = null;
+    this.previewLine = null;
+    this.previewTileKey = null;
     this.world.clearAbilityTargets();
+  }
+
+  // Set a visible, non-audio explanation of the most recent refusal / denial. Presentation only.
+  private setNotice(text: string): void {
+    this.notice = { seq: this.noticeSeq++, text };
   }
 
   // Drive combat/ability/device VFX from the authoritative event stream + real tile geometry. Reads
@@ -503,10 +527,14 @@ private act(action: PlayerAction) {
     const tile = this.world.pickAt(e.clientX, e.clientY);
     const unit = tile ? this.state.units.find((u) => u.alive && u.pos.x === tile.x && u.pos.y === tile.y) : undefined;
     const id = unit ? unit.id : null;
-    if (id === this.hovered) return;
-    this.hovered = id;
-    if (unit) this.applyHover(unit.id);
-    else this.world.clearHover();
+    if (id !== this.hovered) {
+      this.hovered = id;
+      if (unit) this.applyHover(unit.id);
+      else this.world.clearHover();
+    }
+    // Also derive an OUTCOME preview for the hovered tile (armed target or reachable move) so the
+    // player sees what the action will do BEFORE committing. Recomputed only when the tile changes.
+    this.updateHoverPreview(tile);
   };
 
   private onWheel = (e: WheelEvent) => {
@@ -666,7 +694,10 @@ private act(action: PlayerAction) {
     if (!attacker) return;
     const pv = previewAttack(this.state, attackerId, attacker.defaultAttack, target.id);
     if (!pv.valid) {
+      const why = pv.reason === "out_of_range" ? "out of range" : pv.reason === "no_los" ? "no line of sight" : "cannot shoot there";
+      this.setNotice(`Cannot shoot ${target.name}: ${why}.`);
       playSfx("deny");
+      this.sync();
       return;
     }
     this.act({ kind: "attack", unitId: attackerId, ability: attacker.defaultAttack, targetUnitId: target.id });
@@ -676,16 +707,11 @@ private act(action: PlayerAction) {
   // Hovering shows the authoritative legal target set for that ability; unhover clears it. An ARMED
   // highlight is never overwritten by a plain hover (arming persists until used or cancelled).
   hoverAbility(i: number) {
+    if (this.armed) return; // an armed highlight persists until used or cancelled; a plain hover never wipes it
     const sel = this.selectedUnit();
-    if (!sel || this.state.phase !== "player" || this.armed) {
-      this.clearAbilityHighlight();
-      return;
-    }
+    if (!sel || this.state.phase !== "player") return;
     const ability = sel.abilities[i];
-    if (!ability) {
-      this.clearAbilityHighlight();
-      return;
-    }
+    if (!ability) return;
     const t = legalTargetsFor(this.state, sel, ability);
     this.preview = { unitId: sel.id, ability, keys: t.keys, kind: t.kind };
     this.world.setAbilityTargets(t.keys);
@@ -697,11 +723,86 @@ private act(action: PlayerAction) {
     this.world.clearAbilityTargets();
   }
 
+  // Derive the hovered-tile outcome preview from the AUTHORITATIVE sim (previewAttack / reach), so the
+  // shown promise equals the delivered result. Presentation only; mutates nothing. Fires on every
+  // non-drag pointermove but recomputes only when the hovered tile changes.
+  private updateHoverPreview(tile: { x: number; y: number } | null): void {
+    const key = tile ? `${tile.x},${tile.y}` : null;
+    if (key === this.previewTileKey) return;
+    this.previewTileKey = key;
+    const hadLine = this.previewLine !== null;
+    let line: { kind: "attack" | "move" | "support" | "device"; tile: string; text: string } | null = null;
+    if (tile && key && this.state.phase === "player" && !this.state.gameOver) {
+      if (this.armed) {
+        if (this.armed.keys.includes(key)) line = this.describeTargetPreview(tile, key);
+      } else {
+        const sel = this.selectedUnit();
+        if (sel && this.moveRange.has(key)) line = this.describeMovePreview(sel, tile, key);
+      }
+    }
+    if (line === null && !hadLine) return;
+    this.previewLine = line;
+    this.sync();
+  }
+
+  private describeTargetPreview(
+    tile: { x: number; y: number },
+    key: string,
+  ): { kind: "attack" | "move" | "support" | "device"; tile: string; text: string } | null {
+    const armed = this.armed;
+    if (!armed) return null;
+    const shooter = this.state.units.find((u) => u.id === armed.unitId && u.alive);
+    if (!shooter) return null;
+    const def = ABILITIES[armed.ability as keyof typeof ABILITIES];
+    const cost = def?.cost ?? 0;
+    const energyLeft = Math.max(0, shooter.energy - cost);
+    if (armed.kind === "devices") {
+      const dev = this.state.devices.find((d) => d.x === tile.x && d.y === tile.y);
+      if (dev) return { kind: "device", tile: key, text: `Disable ${deviceKindName(dev.kind)} here · ${cost}E (${energyLeft} left).` };
+      return { kind: "device", tile: key, text: `Area effect here · ${cost}E (${energyLeft} left).` };
+    }
+    const unitHere = this.state.units.find((u) => u.alive && u.pos.x === tile.x && u.pos.y === tile.y);
+    if (!unitHere) return null;
+    if (unitHere.side !== "enemy") {
+      return { kind: "support", tile: key, text: `Shield ${unitHere.name} · ${cost}E (${energyLeft} left).` };
+    }
+    const pv = previewAttack(this.state, armed.unitId, armed.ability, unitHere.id);
+    if (!pv.valid) return null;
+    if (armed.ability === "takedown") {
+      return { kind: "attack", tile: key, text: `Silent takedown — neutralises ${unitHere.name}. Cost ${cost}E (${energyLeft} left).` };
+    }
+    const hpAfter = Math.max(0, unitHere.hp - pv.finalDamage);
+    const shield = pv.shielded > 0 ? ` Shield absorbs ${pv.shielded}.` : "";
+    const lethal = pv.lethal ? " Lethal." : "";
+    return {
+      kind: "attack",
+      tile: key,
+      text: `Shot ${unitHere.name} — ${pv.finalDamage} damage, HP ${unitHere.hp} → ${hpAfter}. Energy ${cost} (${energyLeft} left).${shield}${lethal}`,
+    };
+  }
+
+  private describeMovePreview(
+    sel: UnitState,
+    tile: { x: number; y: number },
+    key: string,
+  ): { kind: "move"; tile: string; text: string } | null {
+    const reach = reachableCells(this.state, sel);
+    const info = reach.get(key);
+    if (!info) return null;
+    const path = reconstructPathFromReach(reach, key);
+    if (path.length === 0) return null;
+    const left = Math.max(0, sel.moveLeft - info.cost);
+    const cover = this.coverCellBetween(sel.pos, { x: tile.x, y: tile.y, h: 0 });
+    const note = cover ? " Likely cover at the stop." : " Open ground.";
+    return { kind: "move", tile: key, text: `Move to (${tile.x},${tile.y}) — cost ${info.cost} move, ${left} left. May draw reaction fire.${note}` };
+  }
+
   abilityByIndex(i: number) {
     const sel = this.selectedUnit();
     if (!sel || this.state.phase !== "player" || this.state.gameOver) return;
     const ability = sel.abilities[i];
     if (!ability) return;
+    const label = ABILITIES[ability as keyof typeof ABILITIES]?.label ?? ability;
     // Re-clicking the already-armed ability cancels the arm.
     if (this.armed && this.armed.ability === ability) {
       this.cancelArmed();
@@ -717,18 +818,27 @@ private act(action: PlayerAction) {
     // highlighted target fires it, or Cancel/Esc (or selecting something else) cancels the arm.
     const t = legalTargetsFor(this.state, sel, ability);
     if (t.keys.length === 0) {
+      this.setNotice(`No targets in range for ${label}.`);
       playSfx("deny");
+      this.sync();
       return;
     }
     this.armed = { unitId: sel.id, ability, keys: t.keys, kind: t.kind };
     this.preview = null;
+    this.previewLine = null;
+    this.previewTileKey = null;
     this.world.setAbilityTargets(t.keys, 0xff3a2c);
     playSfx("click");
+    this.sync(); // re-render so the pending-action state is VISIBLE the moment the ability is armed
   }
 
   cancelArmed(): void {
-    if (this.armed) playSfx("deny");
+    if (!this.armed) return;
+    const label = ABILITIES[this.armed.ability as keyof typeof ABILITIES]?.label ?? this.armed.ability;
+    playSfx("deny");
     this.clearAbilityHighlight();
+    this.setNotice(`Cancelled ${label}.`);
+    this.sync();
   }
 
   // Deterministic test hooks (drive the SAME hover/arm path a real pointer/HUD interaction uses).

@@ -23,6 +23,27 @@ The top-right panel has two tabs: a **Commentary** feed of the running turn hist
 (objectives plus squad status). Selecting an operative plays its own robotic line (*"<unit> at your
 service"*). Ability use renders a travelling flight path with a trail and an impact beat.
 
+## Nothing happens silently
+The interface is built so you are never left guessing what an action did — or why it did nothing:
+
+- **Before you confirm, you see the outcome.** With an ability armed, hovering a legal target shows what
+  the shot will do — *"Shot ENFORCER — 5 damage, HP 22 → 17. Energy 3 (3 left)."* — and the promise is
+  asserted against the real result by the test suite, so it cannot drift from what actually happens.
+  Movement previews its destination and cost the same way.
+- **The pending action is always on screen.** Arming a target ability shows a bar naming it — *"Pulse
+  Rifle armed — pick a highlighted target to commit, or cancel."* — with a visible cancel control, so the
+  pending state is legible even if you look away from the board.
+- **Refusals explain themselves in text, not just sound.** Denied actions produce a visible reason
+  (*"No targets in range for Silent Takedown."*, *"Cannot shoot ENFORCER: no line of sight."*), because a
+  sound effect alone is useless when muted, and useless to a deaf player.
+- **System changes are narrated.** The enemy phase writes plain-language lines to the Commentary feed
+  (*"Enemy phase (Turn 1). ENFORCER moved. SENTRY moved. Your phase (Turn 2)."*) rather than moving
+  pieces while the player watches without explanation.
+
+A test suite oracle fails any case where authoritative state changes while the user-visible interface
+does not, and the ability affordances are driven through real pointer events rather than internal hooks,
+so a feature cannot pass its tests while being unreachable in play.
+
 ## Architecture (separation that enables headless testing)
 - `packages/sim` (`@sb/sim`) — authoritative simulation: PRNG, map, A* pathfinding, LOS + cover,
   deterministic combat, abilities, enemy AI (scoring), turn system, replay, save, scoring, replay
