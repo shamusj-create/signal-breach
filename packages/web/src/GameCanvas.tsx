@@ -3,7 +3,8 @@ import * as THREE from "three";
 import { World } from "./scene/World.ts";
 import { TacticalGame } from "./game/TacticalGame.ts";
 import { ui } from "./ui.ts";
-import { stateHash, aiPreview, aiCandidates, reachableCells, decideEnemyActions } from "@sb/sim";
+import { stateHash, aiPreview, aiCandidates, reachableCells, decideEnemyActions, ABILITIES } from "@sb/sim";
+import { SFX_FILES, playSfx, playVoice, getVoiceLog, type SfxName } from "./audio.ts";
 
 declare global {
   interface Window {
@@ -15,6 +16,19 @@ declare global {
     __sbReachableCells?: typeof reachableCells;
     __sbDecide?: typeof decideEnemyActions;
     __sbAiPreview?: typeof aiPreview;
+    // Ability-definition table + render readouts exposed so the TARGETS/FLIGHT specs can compute the
+    // legal target set and the expected screen geometry INDEPENDENTLY of the app's own accessors.
+    __sbAbilities?: typeof ABILITIES;
+    __sbTargetKeys?: () => string[];
+    __sbProjectiles?: () => { kind: string; x: number; y: number; z: number; from: number[]; to: number[]; f: number; impactFired: boolean }[];
+    // Audio oracle surface (read-only to the game): the spec instruments AudioContext and drives
+    // these directly so the proof is against the real audio path, not a cue-name log.
+    __sbAudio?: {
+      sfx: (name: SfxName) => void;
+      voice: (name: string) => void;
+      map: typeof SFX_FILES;
+      voiceLog: () => ReturnType<typeof getVoiceLog>;
+    };
   }
 }
 
@@ -39,6 +53,10 @@ export function GameCanvas({ mission, seed, reducedMotion }: { mission: number; 
     window.__sbReachableCells = reachableCells;
     window.__sbDecide = decideEnemyActions;
     window.__sbAiPreview = aiPreview;
+    window.__sbAudio = { sfx: playSfx, voice: playVoice, map: SFX_FILES, voiceLog: getVoiceLog };
+    window.__sbAbilities = ABILITIES;
+    window.__sbTargetKeys = () => world.debugAbilityTargets();
+    window.__sbProjectiles = () => world.debugProjectiles();
     const onResize = () => world.resize(el.clientWidth, el.clientHeight);
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "F3") {

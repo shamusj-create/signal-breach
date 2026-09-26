@@ -190,15 +190,20 @@ test("device render-state read is per-part and tracks authority", async ({ page 
 // transient (they clear), not permanent scene litter. All measured from the live scene, not a
 // hardcoded screenshot. These ADD to the assertions above (none removed/weakened). ----
 
-// A real firing action must leave an effect object ON THE REAL FIRING LINE (built from the shooter
-// and target tiles), plus a muzzle flash at the shooter. Two different shots must produce two
-// different lines (proof the position comes from real geometry, never a fixed placeholder spot).
-test("weapon fire leaves a tracer on the real firing line + a muzzle flash at the shooter", async ({ page }) => {
+// A real firing action must leave a presentation on the REAL FIRING LINE (built from the shooter and
+// target tiles), plus a muzzle flash at the shooter. Shots now render as a TRAVELLING flight path
+// (world.flight -> a travelling projectile read back via debugProjectiles) rather than the old instant
+// straight tracer, so the geometry-derived firing line is asserted against the flight path: a real
+// attack must raise at least one path whose source/target are the real shooter/target tiles. Two
+// different shots must produce two different lines (proof the position comes from real geometry, never
+// a fixed placeholder spot).
+test("weapon fire raises a flight path on the real firing line + a muzzle flash at the shooter", async ({ page }) => {
   await deploy(page, "/?seed=9&mission=3");
   const out = await page.evaluate(() => {
     const g = (window as unknown as { __sbGame: any }).__sbGame;
     const w = g.world;
     w.clearEffects();
+    w.clearProjectiles();
     // find a genuinely valid shot (in range, line of sight) and fire it via the REAL action path;
     // if the two sides are not yet engaged, advance the sim (same path) until a legal shot exists.
     const findPair = () => {
@@ -216,18 +221,20 @@ test("weapon fire leaves a tracer on the real firing line + a muzzle flash at th
       p = findPair();
     }
     if (p) g.debugAttack(p.pu, p.eu);
-    const tracers = w.debugFx().filter((f: any) => f.kind === "tracer" && f.from && f.to);
+    // The shot's presentation is a travelling flight path derived from the shooter->target tiles.
+    const shots = w.debugProjectiles().filter((x: any) => x.from && x.to);
     const muzzle = w.debugFx().filter((f: any) => f.kind === "muzzle");
-    // a second shot on a DIFFERENT line, to show the tracer is not pinned to one placeholder point
+    // a second shot on a DIFFERENT line, to show the path is not pinned to one placeholder point
+    w.clearProjectiles();
     w.clearEffects();
-    w.fire({ x: 1, y: 12, h: 0 }, { x: 12, y: 2, h: 0 });
-    const second = w.debugFx().filter((f: any) => f.kind === "tracer" && f.from);
-    return { pair: p ? { from: p.from, to: p.to } : null, tracers, muzzle, firstKeys: tracers.map((f: any) => `${f.from}->${f.to}`).join("|"), secondKeys: second.map((f: any) => `${f.from}->${f.to}`).join("|") };
+    w.flight({ x: 1, y: 12, h: 0 }, { x: 12, y: 2, h: 0 });
+    const second = w.debugProjectiles().filter((x: any) => x.from && x.to);
+    return { pair: p ? { from: p.from, to: p.to } : null, shots, muzzle, firstKeys: shots.map((x: any) => `${x.from}->${x.to}`).join("|"), secondKeys: second.map((x: any) => `${x.from}->${x.to}`).join("|") };
   });
   expect(out.pair, "fixture offers at least one valid shot to fire").not.toBeNull();
-  expect(out.tracers.length, "a firing action produced an effect object on the firing line").toBeGreaterThanOrEqual(1);
-  expect(out.tracers[0].from, `tracer built from the shooter tile ${JSON.stringify(out.pair)}`).toEqual([out.pair!.from[0], out.pair!.from[1]]);
-  expect(out.tracers[0].to, "tracer built toward the target tile").toEqual([out.pair!.to[0], out.pair!.to[1]]);
+  expect(out.shots.length, "a firing action raised a flight path on the firing line").toBeGreaterThanOrEqual(1);
+  expect(out.shots[0].from, `flight path built from the shooter tile ${JSON.stringify(out.pair)}`).toEqual([out.pair!.from[0], out.pair!.from[1]]);
+  expect(out.shots[0].to, "flight path built toward the target tile").toEqual([out.pair!.to[0], out.pair!.to[1]]);
   expect(out.muzzle.length, "a firing action produced a muzzle flash at the shooter").toBeGreaterThanOrEqual(1);
   expect(out.secondKeys, "a second line differs from the first (no fixed placeholder)").not.toBe(out.firstKeys);
 });

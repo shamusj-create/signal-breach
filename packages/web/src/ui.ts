@@ -24,6 +24,7 @@ export const initialSnapshot: Snapshot = {
   gameOver: false,
   victory: false,
   enemyBusy: false,
+  feed: [],
 };
 
 export const ui = {

@@ -32,4 +32,5 @@ export interface Snapshot {
   gameOver: boolean;
   victory: boolean;
   enemyBusy: boolean;
+  feed: { seq: number; text: string }[];
 }

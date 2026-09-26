@@ -25,5 +25,10 @@ test("Journey L1 — a legit winning run is re-validated server-side and listed"
   await page.getByTestId("to-results").click();
   await page.getByText("Leaderboard", { exact: true }).click();
   await expect(page.getByText("operator").first()).toBeVisible({ timeout: 10000 });
-  await expect(page.getByText("(OK)")).toBeVisible();
+  // Honest server status now surfaces through the stable server-status hook with player copy
+  // ("Connected"), not the raw "(OK)" developer marker. Re-pointed, not weakened: still visible,
+  // still bounded-timeout, and it proves the live-data path works.
+  const boardStatus = page.getByTestId("server-status");
+  await expect(boardStatus).toBeVisible({ timeout: 10000 });
+  await expect(boardStatus).toContainText("Connected", { timeout: 10000 });
 });

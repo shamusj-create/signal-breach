@@ -35,18 +35,23 @@ test("UI keyboard: menus are operable without a mouse and settings toggles persi
 });
 
 test("UI leaderboard: real backend roundtrip shows honest success then honest failure states", async ({ page }) => {
-  // Success state: server IS running (playwright webServer) — the screen must report OK and
-  // either the empty hint or real rows, never a silent blank.
+  // Success state: server IS running (playwright webServer) — the screen must report a visible
+  // "Connected" status chip and either the empty hint or real rows, never a silent blank.
   await page.goto("/");
   await page.getByTestId("open-leaderboard").click();
-  await expect(page.getByText("(OK)")).toBeVisible({ timeout: 8000 });
+  const statusOk = page.getByTestId("server-status");
+  await expect(statusOk).toBeVisible({ timeout: 8000 });
+  await expect(statusOk).toContainText("Connected", { timeout: 8000 });
   const anyState = await page.locator(".lb").innerText();
   expect(anyState.length, "leaderboard renders empty-hint or rows").toBeGreaterThan(3);
-  // Failure state: with the API unreachable the same screen must degrade honestly.
+  // Failure state: with the API unreachable the same screen must degrade honestly, still through
+  // the status hook — the unavailable state stays covered just as strictly (visible + bounded timeout).
   await page.route("**/api/leaderboard**", (route) => void route.abort());
   await page.goto("/");
   await page.getByTestId("open-leaderboard").click();
-  await expect(page.getByText("(server unavailable)")).toBeVisible({ timeout: 8000 });
+  const statusDown = page.getByTestId("server-status");
+  await expect(statusDown).toBeVisible({ timeout: 8000 });
+  await expect(statusDown).toContainText("Server unavailable", { timeout: 8000 });
 });
 
 test("UI backend: the server rejects an invalid (tampered) submission and it never enters the board", async ({ page }) => {
@@ -70,7 +75,9 @@ test("UI backend: the server rejects an invalid (tampered) submission and it nev
   expect(res.status, "doctored submission is rejected with 400").toBe(400);
   expect(res.body.accepted, "server must not accept a fake win").toBe(false);
   await page.getByTestId("open-leaderboard").click();
-  await expect(page.getByText("(OK)")).toBeVisible({ timeout: 8000 });
+  const statusTamper = page.getByTestId("server-status");
+  await expect(statusTamper).toBeVisible({ timeout: 8000 });
+  await expect(statusTamper).toContainText("Connected", { timeout: 8000 });
   await expect(page.getByText(marker, { exact: true })).toHaveCount(0);
 });
 

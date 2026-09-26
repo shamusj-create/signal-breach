@@ -259,7 +259,51 @@
   padding: var(--sp-3);
   max-height: calc(100vh - 48px);
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
+
+/* ── Right-panel tabs (Commentary / Objectives) ─────────────────────────────────── */
+.tabbar { display: flex; gap: 4px; margin-bottom: 6px; flex: 0 0 auto; justify-content: space-between; }
+.tab {
+  flex: 0 0 auto;
+  font: inherit; font-size: 10px; letter-spacing: 0.5px;
+  padding: 5px 6px; text-align: center; white-space: nowrap;
+  color: var(--text-label);
+  background: rgba(5,15,25,0.60);
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+  cursor: pointer;
+}
+.tab.on { color: var(--neon); border-color: rgba(43,215,255,0.6); background: rgba(43,215,255,0.10); }
+.tabpane { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; }
+.tabpane.feed { gap: 2px; max-height: 340px; }
+.cm-entry { font-size: 11px; line-height: 1.35; color: var(--text-body); padding: 3px 5px; border-radius: var(--r-sm); white-space: normal; overflow-wrap: anywhere; }
+.cm-entry:nth-child(odd) { background: rgba(255,255,255,0.03); }
+.cm-empty { color: var(--text-muted); }
+
+/* Squad rows are now clickable (select the operative with a mouse). */
+.squad-pick {
+  display: flex; align-items: center; gap: var(--sp-2); width: 100%;
+  font: inherit; color: inherit; text-align: left; cursor: pointer;
+  padding: 3px 6px; margin: 2px 0;
+  background: rgba(255,255,255,0.03); border: 1px solid transparent; border-radius: var(--r-sm);
+}
+.squad-pick[data-selected="1"] { border-color: rgba(43,215,255,0.55); background: rgba(43,215,255,0.10); }
+
+/* ── Mouse-only camera + action dock (bottom-LEFT corner, over the outer board rim,
+      deliberately NOT over the central play rows the camera-locked A/B specs sample) ──── */
+.cam-dock {
+  position: absolute; bottom: 12px; left: 12px;
+  display: flex; gap: 6px 8px; align-items: center; flex-wrap: wrap; justify-content: flex-start;
+  width: 176px; padding: 6px 8px; border-radius: var(--r-md);
+  background: var(--panel); border: 1px solid var(--line);
+  pointer-events: none;
+}
+.cam-group { display: flex; align-items: center; gap: 4px; }
+.cam-label { font-size: 9px; letter-spacing: 1px; color: var(--text-label); }
+.cam-btn { min-width: 24px; padding: 3px 6px; text-align: center; cursor: pointer; flex: 0 0 auto; }
+.cam-dock .btn { pointer-events: auto; flex: 0 0 auto; white-space: nowrap; }
+.cam-group { flex: 0 0 auto; }
 
 .obj-title { font-size: 10px; color: var(--teal); letter-spacing: 2px; margin-bottom: 5px; }
 
@@ -355,6 +399,65 @@
 }
 .lb-rank { width: 36px; color: var(--teal); flex-shrink: 0; }
 .lb-score { margin-left: auto; color: var(--amber); }
+
+/* Leaderboard server-status chip — an honest, player-facing connection indicator. */
+.lb-header {
+  display: flex; align-items: center; gap: 12px; justify-content: center;
+  flex-wrap: wrap; width: min(460px, calc(100vw - 40px));
+}
+.server-status {
+  font-size: 12px; letter-spacing: 0.5px;
+  padding: 4px 10px; border-radius: var(--r-md);
+  border: 1px solid var(--line); background: var(--panel);
+  color: var(--text-body);
+}
+.server-status[data-state="connected"] { color: #7dffd8; border-color: rgba(37,224,192,0.55); }
+.server-status[data-state="down"] { color: #ffd0c0; border-color: rgba(255,90,44,0.55); }
+.server-status[data-state="loading"] { color: var(--text-muted); }
+
+/* ── Ability buttons: name + cost/range stacked so labels never clip ────────────── */
+.ability { flex-direction: column; align-items: flex-start; gap: 1px; }
+.ab-sub { font-size: 10px; color: var(--text-label); white-space: nowrap; }
+
+/* ── Objective text block (wraps; never forces the panel wider) ─────────────────── */
+.obj-text { flex: 1 1 auto; min-width: 0; display: block; }
+.obj-line { display: flex; justify-content: space-between; align-items: baseline; gap: 6px; }
+.obj-label { flex: 1 1 auto; min-width: 0; }
+.obj-explain { display: block; margin-top: 1px; font-size: 10px; line-height: 1.25; color: var(--text-label); white-space: normal; overflow-wrap: anywhere; }
+.obj-progress { font-size: 11px; color: var(--text-body); margin: 2px 0 6px; }
+
+/* ── Squad row: name + stacked bar/hp so it can't overflow the panel ────────────── */
+.squad-plot { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.squad-hp { font-size: 10px; text-align: right; color: var(--text-label); }
+
+/* ── Field-guide launcher + panel ───────────────────────────────────────────────── */
+.guide-launcher { position: absolute; top: 52px; right: 12px; pointer-events: auto; z-index: 6; }
+.field-guide { position: absolute; top: 84px; right: 12px; width: min(440px, calc(100vw - 24px)); max-height: calc(100vh - 120px); overflow: hidden; z-index: 6; }
+.fg-head { display: flex; justify-content: space-between; align-items: center; width: 100%; font-size: 12px; letter-spacing: 1px; color: var(--neon); }
+.fg-cols { display: flex; gap: 10px; width: 100%; }
+.fg-col { flex: 1; min-width: 0; }
+.fg-title { font-size: 10px; letter-spacing: 1px; color: var(--teal); margin-bottom: 4px; }
+.fg-item { font-size: 11px; margin: 3px 0; }
+.fg-item-head { display: flex; justify-content: space-between; gap: 6px; }
+.fg-name { color: var(--text-primary); }
+.fg-tag { color: var(--text-label); flex-shrink: 0; }
+.fg-body { color: var(--text-body); }
+.fg-counter { color: var(--text-label); }
+.fg-empty { color: var(--text-muted); font-size: 11px; }
+.fg-foot { font-size: 10px; color: var(--text-muted); margin-top: 6px; }
+
+/* ── First-run overlay: a bottom card that never covers the central play area ───── */
+.onboard-overlay { position: absolute; inset: 0; display: flex; align-items: flex-end; justify-content: center; padding: 0 16px 64px; pointer-events: none; z-index: 5; }
+.onboard-card { pointer-events: auto; width: min(520px, calc(100vw - 32px)); background: var(--panel); border: 1px solid var(--line); border-radius: var(--r-lg); padding: 14px 16px; display: flex; flex-direction: column; gap: 8px; }
+.onboard-title { font-size: 13px; letter-spacing: 1px; color: var(--neon); }
+.onboard-body { display: flex; flex-direction: column; gap: 6px; }
+.onboard-sec { font-size: 12px; color: var(--text-body); line-height: 1.4; }
+.onboard-sec b { color: var(--text-primary); }
+.onboard-actions { display: flex; gap: 8px; justify-content: flex-end; }
+
+/* ── Hover tooltip (pointer-events:none → never blocks the board) ───────────────── */
+.hud-tooltip { position: fixed; max-width: 300px; padding: 8px 10px; background: rgba(6,12,20,0.95); border: 1px solid var(--line); border-radius: var(--r-md); color: var(--text-body); font-size: 12px; line-height: 1.35; pointer-events: none; z-index: 20; opacity: 0; }
+.hud-tooltip[data-show="1"] { opacity: 1; }
 
 /* ── Media queries: prevent clipping and overlap ────────────────────────────────── */
 @media (max-width: 1100px) {

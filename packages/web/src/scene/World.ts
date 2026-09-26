@@ -28,6 +28,9 @@ const COLORS = {
   selection: 0x8affff,
   path: 0x2bd7ff,
   range: 0xff9a3c,
+  trail: 0xffb020,
+  hoverRange: 0x2bd7ff,
+  hoverOutline: 0xb6ff3a,
 };
 
 export interface CameraState {
@@ -51,6 +54,22 @@ interface EffectRec {
   t: number;
   dur: number;
   tick?: (o: THREE.Object3D, f: number) => void;
+}
+
+// A travelling projectile: a presentation-only flight path from a source tile to a target tile. It
+// eases + arcs along that path, drags a fading trail, and resolves with an impact beat at the
+// target. Its live head position is read back by flight-path.spec.ts across frames, so "it travels"
+// is provable against screen geometry rather than a boolean flag. NEVER reads or mutates rules.
+interface Projectile {
+  head: THREE.Group;
+  from: THREE.Vector3;
+  to: THREE.Vector3;
+  arc: number;
+  t: number;
+  dur: number;
+  impactFired: boolean;
+  fromKey: string;
+  toKey: string;
 }
 
 export class World {
@@ -80,9 +99,20 @@ export class World {
   // removed (and disposed) when its timer expires or the board is rebuilt — so no effect can
   // linger past its duration or survive a mission change (no orphaned / late-appended objects).
   effects: EffectRec[] = [];
+  // Traveling projectile effects (presentation-only flight paths). Separate from `effects` so their
+  // per-frame travel can be stepped + sampled independently, but torn down the same way.
+  projectiles: Projectile[] = [];
+  projectileGroup = new THREE.Group();
+  // Persistent (per-selection / per-hover) ability-target highlight layer, kept OUT of fxGroup so
+  // clearMarkers()/clearEffects() never wipe it — it is cleared only explicitly. Presentation only.
+  targetGroup = new THREE.Group();
+  // Display-only time multiplier for the flight path (like tweenScale): raises it so a test yields many
+  // sampled frames across one projectile. Presentational only; never touches authoritative state.
+  flightScale = 1;
   // Reused scratch vectors so the render loop does NOT allocate per frame (see computeCamera).
   private _cv1 = new THREE.Vector3();
   private _cv2 = new THREE.Vector3();
+  private _cv3 = new THREE.Vector3();
   // Shared geometry for cheap additive quads (muzzle/ping/etc). Geometry is shared, never disposed
   // per effect; only the per-effect material is disposed on expiry.
   private _quad = new THREE.PlaneGeometry(1, 1);
@@ -90,6 +120,15 @@ export class World {
   shake = 0;
   animClock = 0;
   reducedMotion = false;
+  // Display-only time multiplier for the move tween (default 1 = production speed). A test may raise
+  // it so even a loaded machine yields many sampled frames across the tween. Purely presentational:
+  // it only stretches the RENDER easing duration and never touches authoritative state. Reduced motion
+  // still snaps (beginMove returns before any tween is created).
+  tweenScale = 1;
+  // Display-only movement tween. Eases a unit's RENDERED position along its real path so movement
+  // reads as motion, not a snap (both sides). Never touches authoritative state; with reducedMotion
+  // on, positions snap instead (beginMove/beginAutoStep no-op and syncUnits keeps its snap path).
+  private moveTween = new Map<string, { pts: THREE.Vector3[]; cum: number[]; total: number; dur: number; t0: number }>();
   fpsValue = 0;
   fpsCount = 0;
   fpsAccum = 0;
@@ -99,6 +138,23 @@ export class World {
   selectionRing: THREE.Group;
   private raycaster = new THREE.Raycaster();
   private groundPlane = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
+
+  // ---- last-move TRAIL (presentation of authoritative movement history) ----
+  // One trail per unit: the tiles it travelled on its MOST RECENT move. Replaced (never appended)
+  // when that unit moves again, kept separate per unit, cleared on board rebuild. Marker children are
+  // named "trail" and live in their own group, so clearMarkers() (which removes "marker") never
+  // touches them and the transient-effect teardown never does either. renderTrails is a CAPTURE-ONLY
+  // toggle (default true) used to produce an isolated A/B of the trail against an otherwise-identical
+  // frame; it gates rendering, never the recorded history. Presentation only; never read for rules.
+  private trailGroup = new THREE.Group();
+  private trailKeys = new Map<string, string[]>();
+  renderTrails = true;
+
+  // ---- HOVER visual: outline + max-move RANGE for the hovered piece (any side) ----
+  // Clear on unhover / state change. Marker children named "hover-range"/"hover-outline".
+  private hoverGroup = new THREE.Group();
+  hoverUnit: string | null = null;
+  hoverRange = new Set<string>();
 
   constructor(container: HTMLElement) {
     this.container = container;
@@ -177,26 +233,39 @@ export class World {
     plinth.receiveShadow = true;
     this.scene.add(plinth);
 
-    // Distant facility silhouettes beyond the plinth: horizon depth cue, pure backdrop,
-    // always outside the playable 14x14 footprint so they can never read as cover.
-    const towers = new THREE.Group();
+    // Distant facility silhouettes beyond the plinth: horizon depth cue, pure backdrop. These are
+    // tagged (name "backdrop") and held in `backdropGroup` so the framing contract can prove they
+    // never intrude into the central foreground region, and so they can never be mistaken for cover.
+    // They sit OUTSIDE the 14x14 footprint (inner radius >= 17.5) and are kept short so a gameplay
+    // pitch projects them into the outer rim, never the middle of the frame.
     const towerMat = new THREE.MeshStandardMaterial({ color: 0x22303f, roughness: 0.95, metalness: 0.1 });
-    const N = 18;
+    const N = 20;
     for (let i = 0; i < N; i++) {
       const a = (i / N) * Math.PI * 2 + 0.19;
-      const r = 15.2 + ((i * 37) % 5) * 0.9;
-      const h = 1.2 + ((i * 53) % 6) * 0.28;
-      const tw = 1.0 + ((i * 29) % 4) * 0.5;
+      const r = 17.5 + ((i * 37) % 5) * 1.1;
+      const h = 0.9 + ((i * 53) % 6) * 0.22;
+      const tw = 1.0 + ((i * 29) % 4) * 0.4;
       const t = new THREE.Mesh(new THREE.BoxGeometry(tw, h, tw * 0.65), towerMat);
       t.position.set(Math.sin(a) * r, h / 2 - 0.05, Math.cos(a) * r);
-      towers.add(t);
+      t.name = "backdrop";
+      t.userData = { backdrop: true };
+      this.backdropGroup.add(t);
     }
-    this.scene.add(towers);
+    this.scene.add(this.backdropGroup);
 
     this.scene.add(this.boardGroup);
     this.scene.add(this.propGroup);
     this.scene.add(this.fogGroup);
     this.scene.add(this.unitGroup);
+    this.trailGroup.name = "trailLayer";
+    this.hoverGroup.name = "hoverLayer";
+    this.scene.add(this.trailGroup);
+    this.scene.add(this.hoverGroup);
+    this.projectileGroup.name = "projectileLayer";
+    this.scene.add(this.projectileGroup);
+    this.targetGroup.name = "targetLayer";
+    this.targetGroup.renderOrder = 7;
+    this.scene.add(this.targetGroup);
 
     // selection reticle: outer + inner ring for an unmistakable marker at gameplay zoom.
     this.selectionRing = new THREE.Group();
@@ -297,8 +366,12 @@ export class World {
   buildBoard(tiles: { x: number; y: number; height: number; terrain: string }[], opts: { hazard: [number, number][] }) {
     void opts;
     // A board rebuild is a mission change: drop any lingering transient effects + particle bursts +
-    // the alert wash so nothing is orphaned or late-appended against the new board.
+    // the alert wash so nothing is orphaned or late-appended against the new board. Trails + hover
+    // are per-mission presentation state too, so they are wiped here (no trail survives a rebuild).
     this.clearEffects();
+    this.clearProjectiles();
+    this.clearTrails();
+    this.clearHover();
     this.buildFog(tiles);
     this.disposeGroup(this.boardGroup);
     const M = this.envMats;
@@ -736,7 +809,17 @@ export class World {
         // state-driven movement lean: reset the rig lean timer when the unit steps to a new tile
         m.userData.key = key;
         m.userData.moveT = this.animClock;
-        m.position.copy(this.tileToWorld({ x: u.pos.x, y: u.pos.y, h: u.pos.h }));
+        // Movement is animated as a display tween (never a rules change). An explicit path tween
+        // (player move, seeded by beginMove before this sync) already owns the unit; otherwise a
+        // unit that simply reached a new tile (e.g. enemy-phase motion) glides via a short auto
+        // step. With reducedMotion on, snap instead of animating.
+        if (!this.moveTween.has(u.id)) {
+          if (this.reducedMotion) {
+            m.position.copy(this.tileToWorld({ x: u.pos.x, y: u.pos.y, h: u.pos.h }));
+          } else {
+            this.beginAutoStep(u.id, { x: u.pos.x, y: u.pos.y, h: u.pos.h });
+          }
+        }
       }
       if (u.side === "player") {
         // face the squad model where the sim says it is looking (facing legibility)
@@ -767,6 +850,7 @@ export class World {
   }
 
   propGroup = new THREE.Group();
+  backdropGroup = new THREE.Group();
   private propGlow = new Map<string, { mat: THREE.MeshStandardMaterial; kind: string }>();
   private extractionRing: THREE.Mesh | null = null;
 
@@ -802,14 +886,17 @@ export class World {
       } else if (d.kind === "terminal") {
         this.propMesh(new THREE.BoxGeometry(0.5, 0.12, 0.5), new THREE.MeshStandardMaterial({ color: 0x22303b, metalness: 0.5, roughness: 0.55 }), bx, base + 0.06, bz, d.id, d.kind, "base", true);
         this.propMesh(new THREE.BoxGeometry(0.44, 0.42, 0.34), new THREE.MeshStandardMaterial({ color: 0x14313d, metalness: 0.4, roughness: 0.55 }), bx, base + 0.34, bz, d.id, d.kind, "console", true);
-        const screen = new THREE.MeshStandardMaterial({ color: 0x0a2530, emissive: 0x2bd7ff, emissiveIntensity: 1.2, metalness: 0.2, roughness: 0.4 });
+        // Amber console read (dimmed): a bright teal operative no longer sits beside a near-identical
+        // cyan prop. Amber is hue- AND luminance-separated from the mint unit marker, so ownership
+        // reads even with hue ignored (this is also why the OFF read below is kept much darker).
+        const screen = new THREE.MeshStandardMaterial({ color: 0x2a2016, emissive: 0xffb454, emissiveIntensity: 0.7, metalness: 0.2, roughness: 0.4 });
         this.propMesh(new THREE.BoxGeometry(0.42, 0.28, 0.05), screen, bx, base + 0.62, bz + 0.15, d.id, d.kind, "screen", false).rotation.x = -0.38;
         this.propGlow.set(d.id, { mat: screen, kind: d.kind });
       } else if (d.kind === "turret") {
         this.propMesh(new THREE.CylinderGeometry(0.26, 0.34, 0.22, 10), new THREE.MeshStandardMaterial({ color: 0x22303b, metalness: 0.55, roughness: 0.5 }), bx, base + 0.11, bz, d.id, d.kind, "base", true);
         this.propMesh(new THREE.CylinderGeometry(0.12, 0.15, 0.26, 8), new THREE.MeshStandardMaterial({ color: 0x33465a, metalness: 0.5, roughness: 0.45 }), bx, base + 0.36, bz, d.id, d.kind, "neck", true);
-        const b1 = new THREE.MeshStandardMaterial({ color: 0x33465a, emissive: 0x2bd7ff, emissiveIntensity: 0.9, metalness: 0.5, roughness: 0.45 });
-        const b2 = new THREE.MeshStandardMaterial({ color: 0x33465a, emissive: 0x2bd7ff, emissiveIntensity: 0.9, metalness: 0.5, roughness: 0.45 });
+        const b1 = new THREE.MeshStandardMaterial({ color: 0x3a3327, emissive: 0xffb454, emissiveIntensity: 0.7, metalness: 0.5, roughness: 0.45 });
+        const b2 = new THREE.MeshStandardMaterial({ color: 0x3a3327, emissive: 0xffb454, emissiveIntensity: 0.7, metalness: 0.5, roughness: 0.45 });
         this.propMesh(new THREE.CylinderGeometry(0.05, 0.05, 0.5, 8), b1, bx - 0.09, base + 0.52, bz + 0.12, d.id, d.kind, "barrel", true).rotation.x = Math.PI / 2;
         this.propMesh(new THREE.CylinderGeometry(0.05, 0.05, 0.5, 8), b2, bx + 0.09, base + 0.52, bz + 0.12, d.id, d.kind, "barrel", true).rotation.x = Math.PI / 2;
         this.propGlow.set(d.id, { mat: b1, kind: d.kind });
@@ -822,7 +909,7 @@ export class World {
         this.propGlow.set(d.id, { mat: lens, kind: d.kind });
       } else if (d.kind === "node") {
         this.propMesh(new THREE.CylinderGeometry(0.14, 0.16, 0.42, 10), new THREE.MeshStandardMaterial({ color: 0x203040, metalness: 0.5, roughness: 0.5 }), bx, base + 0.42, bz, d.id, d.kind, "body", true);
-        const band = new THREE.MeshStandardMaterial({ color: 0x203040, emissive: 0x7fe8ff, emissiveIntensity: 1.0, metalness: 0.4, roughness: 0.5 });
+        const band = new THREE.MeshStandardMaterial({ color: 0x203040, emissive: 0xffb454, emissiveIntensity: 0.7, metalness: 0.4, roughness: 0.5 });
         this.propMesh(new THREE.TorusGeometry(0.26, 0.05, 8, 20), band, bx, base + 0.54, bz, d.id, d.kind, "band", false).rotation.x = Math.PI / 2;
         this.propGlow.set(d.id, { mat: band, kind: d.kind });
       }
@@ -855,24 +942,93 @@ export class World {
             e.mat.color.setHex(0x3a3f46);
             e.mat.emissive.setHex(0x000000);
           } else if (hijack) {
-            e.mat.emissive.setHex(0x25e0c0);
+            // Hijacked = violet, deliberately NOT the mint unit colour (0x25e0c0). A hijacked turret
+            // beside a player operative used to be the same teal; violet + lower lightness separates
+            // them by hue AND brightness, so the flip reads without relying on hue alone.
+            e.mat.emissive.setHex(0xb14bff);
           } else {
-            e.mat.emissive.setHex(0x2bd7ff);
+            e.mat.emissive.setHex(0xffb454);
           }
         }
       } else {
         const e = this.propGlow.get(d.id);
         if (!e) continue;
         const off = d.disabled || !d.powered;
-        if (d.kind === "camera") e.mat.emissive.setHex(off ? 0x223044 : 0xff5a2c);
-        else if (d.kind === "node") e.mat.emissive.setHex(off ? 0x101820 : 0x7fe8ff);
+        if (d.kind === "camera") e.mat.emissive.setHex(off ? 0x2a1206 : 0xff5a2c);
+        else if (d.kind === "node") e.mat.emissive.setHex(off ? 0x140f08 : 0xffb454);
         else if (d.kind === "core") e.mat.emissive.setHex(off ? 0x241038 : 0xb14bff);
-        else if (d.kind === "terminal") e.mat.emissive.setHex(off ? 0x0a1620 : 0x2bd7ff);
+        else if (d.kind === "terminal") e.mat.emissive.setHex(off ? 0x140f08 : 0xffb454);
       }
     }
     if (this.extractionRing) {
       const ex = (this.extractionRing.material as THREE.MeshStandardMaterial);
       ex.emissiveIntensity = 1.2 + Math.sin(performance.now() / 260) * 0.5;
+    }
+  }
+
+  beginMove(unitId: string, path: { x: number; y: number; h: number }[], dur = 1200): void {
+    if (this.reducedMotion) return;
+    const m = this.unitMeshes.get(unitId);
+    if (!m || path.length === 0) return;
+    const pts: THREE.Vector3[] = [m.position.clone()];
+    for (const p of path) {
+      const w = this.tileToWorld(p);
+      const last = pts[pts.length - 1];
+      if (Math.abs(w.x - last.x) + Math.abs(w.y - last.y) + Math.abs(w.z - last.z) < 1e-4) continue;
+      pts.push(w);
+    }
+    if (pts.length < 2) return;
+    const cum: number[] = [0];
+    let total = 0;
+    for (let i = 1; i < pts.length; i++) {
+      total += pts[i].distanceTo(pts[i - 1]);
+      cum.push(total);
+    }
+    if (total < 1e-4) return;
+    this.moveTween.set(unitId, { pts, cum, total, dur: dur * this.tweenScale, t0: performance.now() });
+  }
+
+  private beginAutoStep(id: string, target: { x: number; y: number; h: number }, dur = 300): void {
+    const m = this.unitMeshes.get(id);
+    if (!m) return;
+    const start = m.position.clone();
+    const end = this.tileToWorld(target);
+    const total = start.distanceTo(end);
+    if (total < 1e-4) return;
+    this.moveTween.set(id, { pts: [start, end], cum: [0, total], total, dur: dur * this.tweenScale, t0: performance.now() });
+  }
+
+  moveTweening(): boolean {
+    return this.moveTween.size > 0;
+  }
+
+  stepMoveTweens(now: number): void {
+    if (this.moveTween.size === 0) return;
+    const scratch = this._cv1;
+    for (const [id, tw] of this.moveTween) {
+      const m = this.unitMeshes.get(id);
+      if (!m || !m.visible) {
+        this.moveTween.delete(id);
+        continue;
+      }
+      const f = Math.max(0, Math.min(1, (now - tw.t0) / tw.dur));
+      const eased = f < 0.5 ? 2 * f * f : 1 - Math.pow(-2 * f + 2, 2) / 2;
+      const dist = eased * tw.total;
+      let i = 1;
+      while (i < tw.cum.length && tw.cum[i] < dist) i++;
+      if (i >= tw.cum.length) {
+        m.position.copy(tw.pts[tw.pts.length - 1]);
+        this.moveTween.delete(id);
+        continue;
+      }
+      const segLen = tw.cum[i] - tw.cum[i - 1];
+      const local = segLen > 1e-6 ? (dist - tw.cum[i - 1]) / segLen : 1;
+      scratch.copy(tw.pts[i - 1]).lerp(tw.pts[i], local);
+      m.position.copy(scratch);
+      if (f >= 1) {
+        m.position.copy(tw.pts[tw.pts.length - 1]);
+        this.moveTween.delete(id);
+      }
     }
   }
 
@@ -959,6 +1115,132 @@ export class World {
       if (Array.isArray(mm)) mm.forEach((m) => m.dispose());
       else if (mm) mm.dispose();
     }
+  }
+
+  // ---- TRAIL + HOVER tile-plate helper ----
+  private makeTilePlate(x: number, y: number, color: number, name: string): THREE.Mesh {
+    const geo = new THREE.BoxGeometry(TILE * 0.82, 0.1, TILE * 0.82);
+    const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.5, depthWrite: false });
+    const m = new THREE.Mesh(geo, mat);
+    m.position.set((x - 6.5) * TILE, 0.45, (y - 6.5) * TILE);
+    m.renderOrder = 6;
+    m.name = name;
+    return m;
+  }
+
+  // ---- TRAIL (last-move history) ----
+  // Set (replace) the last-move trail for one unit from the tiles it travelled. Never appends.
+  setTrail(unitId: string, tiles: { x: number; y: number }[]) {
+    const seen = new Set<string>();
+    const keys: string[] = [];
+    for (const t of tiles) {
+      const k = `${Math.round(t.x)},${Math.round(t.y)}`;
+      if (!seen.has(k)) {
+        seen.add(k);
+        keys.push(k);
+      }
+    }
+    this.trailKeys.set(unitId, keys);
+    this.rebuildTrail(unitId);
+  }
+
+  private disposePlateSet(objs: THREE.Object3D[]) {
+    for (const o of objs) {
+      this.trailGroup.remove(o);
+      if ((o as THREE.Mesh).geometry) (o as THREE.Mesh).geometry.dispose();
+      const mm = (o as THREE.Mesh).material as THREE.Material | undefined;
+      if (mm) mm.dispose();
+    }
+  }
+
+  private rebuildTrail(unitId: string) {
+    const prev = this.trailGroup.userData[unitId] as THREE.Object3D[] | undefined;
+    if (prev) this.disposePlateSet(prev);
+    delete this.trailGroup.userData[unitId];
+    if (!this.renderTrails) return;
+    const keys = this.trailKeys.get(unitId);
+    if (!keys) return;
+    const objs: THREE.Object3D[] = [];
+    for (const k of keys) {
+      const [xs, ys] = k.split(",");
+      const m = this.makeTilePlate(Number(xs), Number(ys), COLORS.trail, "trail");
+      this.trailGroup.add(m);
+      objs.push(m);
+    }
+    this.trailGroup.userData[unitId] = objs;
+  }
+
+  // Capture-only toggle: rebuild every trail's markers from stored history without changing history.
+  setRenderTrails(v: boolean) {
+    this.renderTrails = v;
+    for (const unitId of [...this.trailKeys.keys()]) this.rebuildTrail(unitId);
+  }
+
+  clearTrails() {
+    for (const unitId of Object.keys(this.trailGroup.userData)) {
+      const objs = this.trailGroup.userData[unitId] as THREE.Object3D[];
+      this.disposePlateSet(objs);
+      delete this.trailGroup.userData[unitId];
+    }
+    this.trailKeys.clear();
+  }
+
+  debugTrail(): Record<string, string[]> {
+    const out: Record<string, string[]> = {};
+    for (const [k, v] of this.trailKeys) out[k] = v.slice();
+    return out;
+  }
+
+  // ---- HOVER (outline + max-move range) ----
+  clearHover() {
+    for (const o of [...this.hoverGroup.children]) {
+      this.hoverGroup.remove(o);
+      if ((o as THREE.Mesh).geometry) (o as THREE.Mesh).geometry.dispose();
+      const mm = (o as THREE.Mesh).material as THREE.Material | undefined;
+      if (mm) mm.dispose();
+    }
+    this.hoverUnit = null;
+    this.hoverRange.clear();
+  }
+
+  // Highlight the hovered piece: a bounding-hugging outline shell + ring, plus the max-move range
+  // tiles. at = world position to centre the outline (the piece's tile). Clears any prior hover.
+  setHover(unitId: string | null, at: { x: number; y: number; z: number }, rangeKeys: string[]) {
+    this.clearHover();
+    if (!unitId) return;
+    this.hoverUnit = unitId;
+    this.hoverRange = new Set(rangeKeys);
+    for (const k of rangeKeys) {
+      const [xs, ys] = k.split(",");
+      const m = this.makeTilePlate(Number(xs), Number(ys), COLORS.hoverRange, "hover-range");
+      this.hoverGroup.add(m);
+    }
+    let r = 0.7;
+    let h = 1.3;
+    const mesh = this.unitMeshes.get(unitId);
+    if (mesh) {
+      const bb = new THREE.Box3().setFromObject(mesh);
+      const size = bb.getSize(new THREE.Vector3());
+      r = Math.max(0.55, Math.min(1.6, (Math.max(size.x, size.z) / 2) * 1.35));
+      h = Math.max(0.6, Math.min(2.4, size.y + 0.35));
+    }
+    const ringGeo = new THREE.RingGeometry(r * 0.72, r, 40);
+    const ring = new THREE.Mesh(ringGeo, new THREE.MeshBasicMaterial({ color: COLORS.hoverOutline, transparent: true, opacity: 0.85, side: THREE.DoubleSide, depthWrite: false }));
+    ring.rotation.x = -Math.PI / 2;
+    ring.position.set(at.x, 0.155, at.z);
+    ring.renderOrder = 7;
+    ring.name = "hover-outline";
+    this.hoverGroup.add(ring);
+    const shellGeo = new THREE.CylinderGeometry(r * 0.7, r * 0.7, h, 22, 1, true);
+    const shell = new THREE.Mesh(shellGeo, new THREE.MeshBasicMaterial({ color: COLORS.hoverOutline, transparent: true, opacity: 0.34, side: THREE.DoubleSide, depthWrite: false }));
+    shell.position.set(at.x, h / 2 + 0.12, at.z);
+    shell.renderOrder = 7;
+    shell.name = "hover-outline";
+    this.hoverGroup.add(shell);
+  }
+
+  debugHover(): { unit: string | null; range: string[]; outline: boolean } {
+    return { unit: this.hoverUnit, range: [...this.hoverRange], outline: this.hoverGroup.children.some((o) => o.name === "hover-outline") };
   }
 
   // ---- effects (transient, allocation-light, geometry-driven) ----
@@ -1076,6 +1358,165 @@ export class World {
   fire(from: { x: number; y: number; h: number }, to: { x: number; y: number; h: number }, color = 0xfff0b0) {
     this.muzzle(from);
     this.tracer(from, to, color);
+  }
+
+  // ---- FLIGHT PATH (presentation-only, both sides, reduced-motion aware) ----------------------
+  // A ranged ability's shot is shown as a projectile that TRAVELS a visible path from the user to the
+  // target, then lands an impact beat when the effect RESOLVES — not the old instant straight tracer.
+  // Presentation only: it reads tile geometry, never authoritative state, and changes no damage/timing.
+  // reducedMotion: no travel animation is created; the impact beat resolves instantly instead.
+  flight(from: { x: number; y: number; h: number }, to: { x: number; y: number; h: number }, color = 0xff9a3c): void {
+    const wa = this.tileToWorld(from);
+    wa.y += 0.55; // barrel height
+    const wb = this.tileToWorld(to);
+    wb.y += 0.5; // impact height
+    const dist = wa.distanceTo(wb);
+    // Reduced motion: no travel. Drop a brief full-length streak + an immediate impact so the beat
+    // still fires, but nothing animates across frames (flight-path.spec asserts instant resolve).
+    if (this.reducedMotion) {
+      const geo = new THREE.BufferGeometry().setFromPoints([wa, wb]);
+      const line = new THREE.Line(geo, new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.9, blending: THREE.AdditiveBlending, depthWrite: false }));
+      line.userData = { kind: "flight", from: [from.x, from.y], to: [to.x, to.y] };
+      this.addFx(line, 0.12, (o, f) => { ((o as THREE.Line).material as THREE.LineBasicMaterial).opacity = 0.9 * (1 - f); });
+      this.impact(to, color, 0.9);
+      return;
+    }
+    this.muzzle(from, color);
+    // The travelling projectile: a bright additive head + a growing streak that marks the path flown.
+    const group = new THREE.Group();
+    const core = new THREE.Mesh(this._quad, new THREE.MeshBasicMaterial({ color: 0xfff0b0, transparent: true, opacity: 0.95, blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide }));
+    core.scale.setScalar(0.2);
+    const trailGeo = new THREE.BufferGeometry();
+    trailGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(6), 3));
+    const trail = new THREE.Line(trailGeo, new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.85, blending: THREE.AdditiveBlending, depthWrite: false }));
+    trail.frustumCulled = false;
+    group.add(trail);
+    group.add(core);
+    group.userData = { kind: "flight", from: [from.x, from.y], to: [to.x, to.y] };
+    this.projectileGroup.add(group);
+    const dur = Math.max(0.26, Math.min(0.62, dist * 0.11)) * this.flightScale;
+    const arc = Math.min(1.0, 0.14 + dist * 0.09);
+    const proj: Projectile = {
+      head: group,
+      from: wa,
+      to: wb,
+      arc,
+      t: 0,
+      dur,
+      impactFired: false,
+      fromKey: `${from.x},${from.y}`,
+      toKey: `${to.x},${to.y}`,
+    };
+    this.projectiles.push(proj);
+  }
+
+  // Advance every live projectile one frame. Eased + arced travel; the impact lands when the effect
+  // resolves (f reaches 1), then the projectile is torn down. Never allocates a new scene object per
+  // frame beyond the one-time trail buffer it updates in place.
+  stepProjectiles(dt: number): void {
+    for (let i = this.projectiles.length - 1; i >= 0; i--) {
+      const p = this.projectiles[i];
+      p.t += dt;
+      const f = Math.max(0, Math.min(1, p.t / p.dur));
+      const eased = f < 0.5 ? 2 * f * f : 1 - Math.pow(-2 * f + 2, 2) / 2;
+      // lerp along the line, lifted by a sine arc that peaks mid-flight (reads as an arcing burst).
+      const x = p.from.x + (p.to.x - p.from.x) * eased;
+      const y = p.from.y + (p.to.y - p.from.y) * eased + Math.sin(Math.PI * f) * p.arc;
+      const z = p.from.z + (p.to.z - p.from.z) * eased;
+      p.head.position.set(x, y, z);
+      // trail = a streak from the launch point to the current head (grows along the flown path).
+      const trail = p.head.children[0] as THREE.Line;
+      const attr = trail.geometry.getAttribute("position") as THREE.BufferAttribute;
+      const arr = attr.array as Float32Array;
+      arr[0] = p.from.x; arr[1] = p.from.y; arr[2] = p.from.z;
+      arr[3] = x - p.from.x; arr[4] = y - p.from.y; arr[5] = z - p.from.z;
+      attr.needsUpdate = true;
+      const head = p.head.children[1] as THREE.Mesh;
+      head.scale.setScalar(0.2 * (1 - f * 0.4));
+      (trail.material as THREE.LineBasicMaterial).opacity = 0.85 * (1 - f * 0.5);
+      if (f >= 1) {
+        if (!p.impactFired) {
+          p.impactFired = true;
+          const [tx, ty] = p.toKey.split(",").map(Number);
+          this.impact({ x: tx, y: ty, h: 0 }, 0xff9a3c, 0.9);
+        }
+        // resolve: drop the projectile group after the impact beat has started.
+        this.projectileGroup.remove(p.head);
+        trail.geometry.dispose();
+        (trail.material as THREE.Material).dispose();
+        (head.material as THREE.Material).dispose();
+        this.projectiles.splice(i, 1);
+      }
+    }
+  }
+
+  // Test readout: every live projectile with its world head position + its source/target tile keys,
+  // so flight-path.spec.ts can sample screen positions across frames and derive start/end/impact
+  // expectations from geometry (not from an animation flag).
+  debugProjectiles(): { kind: string; x: number; y: number; z: number; from: number[]; to: number[]; f: number; impactFired: boolean }[] {
+    const out: { kind: string; x: number; y: number; z: number; from: number[]; to: number[]; f: number; impactFired: boolean }[] = [];
+    for (const p of this.projectiles) {
+      out.push({
+        kind: "flight",
+        x: +p.head.position.x.toFixed(3),
+        y: +p.head.position.y.toFixed(3),
+        z: +p.head.position.z.toFixed(3),
+        from: p.fromKey.split(",").map(Number),
+        to: p.toKey.split(",").map(Number),
+        f: +(p.t / p.dur).toFixed(4),
+        impactFired: p.impactFired,
+      });
+    }
+    return out;
+  }
+
+  // ---- ability-target highlight (presentation of the authoritative legal target set) ----------
+  // Drawn in a persistent layer (targetGroup), NOT fxGroup, so clearMarkers/clearEffects never wipe
+  // it. Cleared only via clearAbilityTargets (on resolve/cancel/rebuild). Keys are "x,y" tile coords.
+  setAbilityTargets(keys: string[], color = 0xff5a2c): void {
+    this.clearAbilityTargets();
+    for (const k of keys) {
+      const [xs, ys] = k.split(",");
+      const x = Number(xs);
+      const y = Number(ys);
+      if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+      const geo = new THREE.BoxGeometry(TILE * 0.86, 0.14, TILE * 0.86);
+      const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.55, depthWrite: false });
+      const m = new THREE.Mesh(geo, mat);
+      m.position.set((x - 6.5) * TILE, 0.5, (y - 6.5) * TILE);
+      m.renderOrder = 7;
+      m.name = "target";
+      this.targetGroup.add(m);
+    }
+  }
+
+  clearAbilityTargets(): void {
+    for (const o of [...this.targetGroup.children]) {
+      this.targetGroup.remove(o);
+      const mm = (o as THREE.Mesh).material as THREE.Material | undefined;
+      if ((o as THREE.Mesh).geometry) (o as THREE.Mesh).geometry.dispose();
+      if (mm) mm.dispose();
+    }
+  }
+
+  // Drop every live projectile (mission change / reset). Presentation teardown only.
+  clearProjectiles(): void {
+    for (const p of this.projectiles) {
+      this.projectileGroup.remove(p.head);
+      for (const c of p.head.children) {
+        if ((c as THREE.Mesh).geometry) (c as THREE.Mesh).geometry.dispose();
+        const mm = (c as THREE.Mesh).material as THREE.Material | undefined;
+        if (mm) mm.dispose();
+      }
+    }
+    this.projectiles.length = 0;
+  }
+
+  debugAbilityTargets(): string[] {
+    return this.targetGroup.children.map((o) => {
+      const p = (o as THREE.Mesh).position;
+      return `${Math.round(p.x / TILE + 6.5)},${Math.round(p.z / TILE + 6.5)}`;
+    });
   }
 
   // Hit: a bright ground flash + expanding shock ring plus a spark burst and a debris/smoke puff at
@@ -1283,11 +1724,23 @@ export class World {
   // ---- camera ----
   angleQuarters = 0;
   zoom = 1;
+  // Vertical offset (world units) added to the camera lookAt target relative to `focus`. A negative
+  // value lowers the aim (camera looks slightly downward past the board), which recentres the whole-orbit
+  // framing. Measured over 32 azimuths at lookY=-2: maxCentre 0.097, minCov 0.399, no silhouette overlap,
+  // no central intrusion. Does not change fov/distance/height and does not touch focus (pan unchanged).
+  lookY = -2.0;
   setAngle(q: number) {
-    this.angleQuarters = ((q % 4) + 4) % 4;
+    // Continuous azimuth (in quarter turns). Kept fractional so the orbit can sweep a full 360
+    // through intermediate angles; the quarter keyboard/HUD path still lands on exact 0/1/2/3.
+    this.angleQuarters = q;
   }
   rotateQuarter(dir: number) {
     this.setAngle(this.angleQuarters + dir);
+  }
+  // Continuous azimuth from a left-drag (in quarter-turns). Keeps the value in [0,4) so a full 360
+  // sweep wraps cleanly; the camera pivots around the CURRENT focus (its central pivot).
+  orbitBy(dQuarters: number) {
+    this.angleQuarters = (((this.angleQuarters + dQuarters) % 4) + 4) % 4;
   }
   focus = new THREE.Vector3(0, 0, 0);
   focusTile(x: number, y: number) {
@@ -1296,20 +1749,29 @@ export class World {
   zoomBy(d: number) {
     this.zoom = Math.max(0.55, Math.min(2.1, this.zoom + d));
   }
+  // View-relative pan (shared by the drag path and the four HUD pan buttons). The two ground axes
+  // are derived FROM THE LIVE CAMERA (its projected screen-right and its horizontal view direction),
+  // NOT from a hardcoded board azimuth. Arguments are screen-space: dxa = right, dya = down. A fixed
+  // landmark therefore follows the cursor: a right-drag (dxa>0) makes it move screen-RIGHT, a
+  // down-drag (dya>0) makes it move screen-DOWN — at every orbit angle. Replaces the old
+  // (sin a+0.8, cos a+0.8) helper, which was up to ~82 deg off the true screen axes and pushed
+  // focus along the view direction (a near no-op) at Q1-Q3.
   pan(dxa: number, dya: number) {
-    const right = this.getAzimuth().right;
-    const fwd = this.getAzimuth().fwd;
-    this.focus.addScaledVector(right, dxa);
+    const fwd = this._cv1.set(0, 0, -1).applyQuaternion(this.camera.quaternion);
+    fwd.y = 0;
+    if (fwd.lengthSq() < 1e-9) return;
+    fwd.normalize();
+    const right = this._cv2.set(1, 0, 0).applyQuaternion(this.camera.quaternion);
+    right.y = 0;
+    if (right.lengthSq() < 1e-9) return;
+    right.normalize();
+    // Right-drag: camera/focus move -screen-right so the world slides screen-right (follows cursor).
+    // Down-drag: camera/focus move +forward (deeper into the scene) so the world slides screen-down.
+    this.focus.addScaledVector(right, -dxa);
     this.focus.addScaledVector(fwd, dya);
     // clamp to board area
     this.focus.x = Math.max(-8, Math.min(8, this.focus.x));
     this.focus.z = Math.max(-8, Math.min(8, this.focus.z));
-  }
-  getAzimuth(): { right: THREE.Vector3; fwd: THREE.Vector3 } {
-    const a = (this.angleQuarters * Math.PI) / 2;
-    const dir = new THREE.Vector3(Math.sin(a) + 0.8, 0, Math.cos(a) + 0.8).normalize();
-    const right = new THREE.Vector3().crossVectors(new THREE.Vector3(0, 1, 0), dir).normalize();
-    return { right, fwd: dir };
   }
   // Optional fixed-camera pose used only by the off-by-default review capture tool to frame a
   // single subject. When null (always during gameplay) the orbit camera below runs unchanged.
@@ -1323,8 +1785,13 @@ export class World {
       return;
     }
     const a = (this.angleQuarters * Math.PI) / 2;
-    const dist = 13.4 * this.zoom;
-    const height = 9.2 * this.zoom;
+    // Framing contract: the playfield must dominate the viewport and backdrop props must stay in the
+    // outer rim (never the central foreground). A steeper, slightly longer orbit (pitch ~41 deg vs the
+    // old ~34 deg) lifts the horizon tower ring toward the top edge and keeps the whole 14x14 board
+    // centred, instead of the old shallow pose that let far backdrop blocks loom large mid-frame and
+    // let a target-nudge drop half the board off-screen.
+    const dist = 14.6 * this.zoom;
+    const height = 12.6 * this.zoom;
     // Reused scratch vectors: the render loop must not allocate per frame. Offsets reproduce the
     // previous (sin,0,cos)-normalised horizontal run at length `dist` with a fixed `height` lift.
     const off = this._cv1.set(Math.sin(a), 0, Math.cos(a));
@@ -1334,12 +1801,164 @@ export class World {
     const pos = this._cv2.copy(this.focus).add(off);
     const lerp = this.reducedMotion ? 1 : 0.15;
     this.camera.position.lerp(pos, lerp);
-    this.camera.lookAt(this.focus);
+    // Look target is lifted 2.0 above the focus so the whole-orbit board stays centred without changing
+    // the optics (fov/dist/height/pitch and therefore the fog relationship are untouched). focus itself
+    // is left alone, so pan and gameplay semantics (which move focus) are unchanged.
+    const look = this._cv3.copy(this.focus);
+    look.y += this.lookY;
+    this.camera.lookAt(look);
     if (this.shake > 0.001) {
       this.camera.position.x += (Math.random() - 0.5) * this.shake;
       this.camera.position.y += (Math.random() - 0.5) * this.shake;
       this.shake *= 0.86;
     }
+  }
+
+  // Framing readout for the CAMERA criterion (e2e/camera-frame.spec.ts). Purely geometric: projects
+  // the playfield footprint and every tagged backdrop prop through the CURRENT camera and reports
+  // screen coverage / centring + any backdrop intrusion into the central foreground region. No
+  // gameplay effect; the render loop never calls it. Central foreground region = |NDC|<=0.30 on both
+  // axes (the middle 60% of the frame); backdrop props must not land there.
+  debugCameraMetrics(): {
+    ok: boolean; W: number; H: number; camY: number; pitchDeg: number;
+    playfield: { cov: number; centerDist: number; box: { x: number; y: number; w: number; h: number } };
+    backdropTotal: number; backdropOnScreen: number; backdropIntrude: number; backdropOverPlayfield: number; maxOverlapArea: number; intruders: string[];
+    maxBackdropProjSize: number; bboxOverPlayfield: number; maxBboxOverlapArea: number;
+  } {
+    this.camera.updateMatrixWorld(true);
+    this.camera.matrixWorldInverse.copy(this.camera.matrixWorld).invert();
+    const canvas = this.renderer.domElement;
+    const CW = canvas.clientWidth || canvas.width;
+    const CH = canvas.clientHeight || canvas.height;
+    const proj = (x: number, y: number, z: number) => {
+      const p = new THREE.Vector3(x, y, z).project(this.camera);
+      return { sx: (p.x * 0.5 + 0.5) * CW, sy: (-p.y * 0.5 + 0.5) * CH, nx: p.x, ny: p.y, z: p.z };
+    };
+    // Playfield footprint: project the 8 corners of the 14x14 board volume. The AABB drives coverage +
+    // centring (UNCHANGED); the TRUE projected silhouette (convex hull of the same corners) is what the
+    // backdrop-overlap bar is named after. A diamond's AABB is ~twice its area and its four corners are
+    // empty space beside the board, so a tower receding past a shoulder lands in an empty corner and the
+    // old AABB test called that "over the playfield" when it was over nothing. Measured against the
+    // convex hull (the most generous possible footprint) a prop is only "over the board" if it truly is.
+    const boardPts: number[][] = [];
+    let minx = 1e9, maxx = -1e9, miny = 1e9, maxy = -1e9;
+    for (let i = 0; i < 8; i++) {
+      const p = proj(i & 1 ? 7 : -7, i & 2 ? 1.7 : 0, i & 4 ? 7 : -7);
+      boardPts.push([p.sx, p.sy]);
+      minx = Math.min(minx, p.sx); maxx = Math.max(maxx, p.sx);
+      miny = Math.min(miny, p.sy); maxy = Math.max(maxy, p.sy);
+    }
+    const cov = (Math.max(0, maxx - minx) * Math.max(0, maxy - miny)) / (CW * CH);
+    const acx = (minx + maxx) / 2, acy = (miny + maxy) / 2;
+    const centerDist = Math.hypot((acx - CW / 2) / (CW / 2), (acy - CH / 2) / (CH / 2));
+    // 2D convex hull (Andrew monotone chain), normalised to CCW so the clip inside-test is consistent.
+    const signed2 = (P: number[][]): number => { let a = 0; for (let i = 0, n = P.length; i < n; i++) { const j = (i + 1) % n; a += P[i][0] * P[j][1] - P[j][0] * P[i][1]; } return a / 2; };
+    const hull = (pts: number[][]): number[][] => {
+      const P = pts.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+      if (P.length < 3) return P;
+      const cross = (o: number[], a: number[], b: number[]) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+      const lower: number[][] = [];
+      for (const p of P) { while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop(); lower.push(p); }
+      const upper: number[][] = [];
+      for (let i = P.length - 1; i >= 0; i--) { const p = P[i]; while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop(); upper.push(p); }
+      lower.pop(); upper.pop();
+      const h = lower.concat(upper);
+      return signed2(h) < 0 ? h.reverse() : h;
+    };
+    const isect = (p1: number[], p2: number[], a: number[], b: number[]): number[] => {
+      const dcx = b[0] - a[0], dcy = b[1] - a[1];
+      let t = ((a[0] - p1[0]) * dcy - (a[1] - p1[1]) * dcx) / ((p2[0] - p1[0]) * dcy - (p2[1] - p1[1]) * dcx);
+      if (!isFinite(t)) t = 0;
+      return [p1[0] + t * (p2[0] - p1[0]), p1[1] + t * (p2[1] - p1[1])];
+    };
+    // Portion of SUBJECT inside a CONVEX clip polygon via Sutherland–Hodgman (= subject ∩ clip).
+    const clipConvex = (subject: number[][], clip: number[][]): number[][] => {
+      let out = subject;
+      for (let i = 0, n = clip.length; i < n && out.length; i++) {
+        const a = clip[i], b = clip[(i + 1) % n];
+        const inside = (p: number[]) => (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]) >= 0;
+        const inp: number[][] = [];
+        for (let k = 0, m = out.length; k < m; k++) {
+          const cur = out[k], prev = out[(k - 1 + m) % m];
+          const ci = inside(cur), pi = inside(prev);
+          if (ci) { if (!pi) inp.push(isect(prev, cur, a, b)); inp.push(cur); }
+          else if (pi) inp.push(isect(prev, cur, a, b));
+        }
+        out = inp;
+      }
+      return out;
+    };
+    const boardHull = hull(boardPts);
+    // Backdrop props: how many project into the central foreground region, and their biggest size.
+    let backdropTotal = 0, backdropOnScreen = 0, backdropIntrude = 0;
+    const intruders: string[] = [];
+    let maxProj = 0;
+    // A backdrop prop is a foreground violation if it lands inside the central 60% box OR its projected
+    // footprint actually sits over the BOARD — its convex hull intersecting the board's convex hull — not
+    // merely inside the board's empty AABB corners. The old AABB-corner overlap is still computed and
+    // reported (bboxOverPlayfield / maxBboxOverlapArea) as an auditable diagnostic, but the BAR asserts
+    // on the silhouette measure (backdropOverPlayfield), which is what "over the board" actually means.
+    const pf = { x: minx, y: miny, w: maxx - minx, h: maxy - miny };
+    let backdropOverPlayfield = 0;
+    let maxOverlapArea = 0;
+    let bboxOverPlayfield = 0;
+    let maxBboxOverlapArea = 0;
+    for (const c of this.backdropGroup.children) {
+      backdropTotal++;
+      const bb = new THREE.Box3().setFromObject(c);
+      let bminx = 1e9, bmaxx = -1e9, bminy = 1e9, bmaxy = -1e9, anyFront = false;
+      const propPts: number[][] = [];
+      for (let i = 0; i < 8; i++) {
+        const cx = i & 1 ? bb.max.x : bb.min.x;
+        const cy = i & 2 ? bb.max.y : bb.min.y;
+        const cz = i & 4 ? bb.max.z : bb.min.z;
+        const p = proj(cx, cy, cz);
+        if (p.z <= 1) anyFront = true;
+        propPts.push([p.sx, p.sy]);
+        bminx = Math.min(bminx, p.sx); bmaxx = Math.max(bmaxx, p.sx);
+        bminy = Math.min(bminy, p.sy); bmaxy = Math.max(bmaxy, p.sy);
+      }
+      const centerP = new THREE.Vector3(c.position.x, c.position.y, c.position.z).project(this.camera);
+      const onScreen = anyFront && centerP.z < 1 && bmaxx >= 0 && bmaxy >= 0 && bminx <= CW && bminy <= CH;
+      if (onScreen) backdropOnScreen++;
+      const inCentral = onScreen && Math.abs(centerP.x) <= 0.30 && Math.abs(centerP.y) <= 0.30;
+      if (inCentral) {
+        backdropIntrude++;
+        intruders.push(`${c.position.x.toFixed(1)},${c.position.z.toFixed(1)}:central`);
+      }
+      // footprint overlap against the playfield SILHOUETTE (only meaningful if on-screen & in front).
+      if (onScreen) {
+        const propHull = hull(propPts);
+        const inter = propHull.length >= 3 && boardHull.length >= 3 ? clipConvex(propHull, boardHull) : [];
+        const oArea = inter.length >= 3 ? Math.abs(signed2(inter)) / 2 / (CW * CH) : 0;
+        if (oArea > 0.0005) {
+          backdropOverPlayfield++;
+          if (oArea > maxOverlapArea) maxOverlapArea = oArea;
+          if (!inCentral) intruders.push(`${c.position.x.toFixed(1)},${c.position.z.toFixed(1)}:overlap ${(oArea * 100).toFixed(2)}%`);
+        }
+        // secondary diagnostic, NOT asserted: the old AABB-corner overlap, kept so the change is auditable.
+        const ox = Math.max(0, Math.min(bmaxx, pf.x + pf.w) - Math.max(bminx, pf.x));
+        const oy = Math.max(0, Math.min(bmaxy, pf.y + pf.h) - Math.max(bminy, pf.y));
+        const bbArea = (ox * oy) / (CW * CH);
+        if (bbArea > 0.0005) {
+          bboxOverPlayfield++;
+          if (bbArea > maxBboxOverlapArea) maxBboxOverlapArea = bbArea;
+        }
+      }
+      const rad = bb.getSize(new THREE.Vector3()).length() / 2;
+      const e2 = new THREE.Vector3(c.position.x + rad, c.position.y, c.position.z).project(this.camera);
+      const s1 = proj(c.position.x, c.position.y, c.position.z);
+      const s2 = { sx: (e2.x * 0.5 + 0.5) * CW, sy: (-e2.y * 0.5 + 0.5) * CH };
+      maxProj = Math.max(maxProj, Math.hypot(s2.sx - s1.sx, s2.sy - s1.sy) / Math.min(CW, CH));
+    }
+    const camDir = this.camera.getWorldDirection(new THREE.Vector3());
+    const pitchDeg = (Math.asin(Math.max(-1, Math.min(1, -camDir.y))) * 180) / Math.PI;
+    return {
+      ok: true, W: CW, H: CH, camY: +this.camera.position.y.toFixed(2), pitchDeg: +pitchDeg.toFixed(1),
+      playfield: { cov: +cov.toFixed(3), centerDist: +centerDist.toFixed(3), box: { x: +(minx / CW).toFixed(3), y: +(miny / CH).toFixed(3), w: +((maxx - minx) / CW).toFixed(3), h: +((maxy - miny) / CH).toFixed(3) } },
+      backdropTotal, backdropOnScreen, backdropIntrude, backdropOverPlayfield, maxOverlapArea: +(maxOverlapArea * 100).toFixed(3), intruders, maxBackdropProjSize: +maxProj.toFixed(3),
+      bboxOverPlayfield, maxBboxOverlapArea: +(maxBboxOverlapArea * 100).toFixed(3),
+    };
   }
 
   pickAt(clientX: number, clientY: number): { x: number; y: number } | null {
@@ -1374,8 +1993,10 @@ export class World {
       this.computeCamera();
       this.updateParticles(dt);
       this.updateEffects(dt);
+      this.stepProjectiles(dt);
       this.updateAlertWash();
       if (!this.reducedMotion) {
+        this.stepMoveTweens(t);
         this.animateUnits(dt);
       }
       if (this.composer) this.composer.render();

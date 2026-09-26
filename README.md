@@ -1,127 +1,57 @@
 # Signal Breach
 
-**A 3D isometric turn-based tactical infiltration game for the browser** — deterministic simulation,
-no dice, and a leaderboard that only accepts submissions the server can replay and verify itself.
+A 3D isometric turn-based tactical infiltration game. Deterministic simulation (no dice), Three.js
+presentation, React HUD, Node + SQLite server that validates replays against the shared sim.
 
-![Signal Breach title screen](docs/screenshots/review-1280x720-title.png)
+**Play it:** `npm install`, then `npm run serve` and `npm run dev -w @sb/web` (the dev server proxies
+`/api` to the backend). See [Run](#run) below.
 
-Three operatives infiltrate a security facility across a grid of tiles. You move, breach, hack and
-extract under fog of war, enemy detection cones and an escalating alarm — and because the simulation
-is fully deterministic, every recorded run can be re-executed and checked by the server before it is
-allowed on the board.
-
----
-
-## Screenshots
-
-| Gameplay | Environment |
-| --- | --- |
-| ![Tactical board](docs/screenshots/review-1280x720-tactical.png) | ![Mission 3](docs/screenshots/review-1280x720-fx-impact.png) |
-
-| Vanguard | Ghost | Cipher |
-| --- | --- | --- |
-| ![Vanguard](docs/screenshots/review-1280x720-char-vanguard.png) | ![Ghost](docs/screenshots/review-1280x720-char-ghost.png) | ![Cipher](docs/screenshots/review-1280x720-char-cipher.png) |
-
-Screenshots are captured straight from the browser test suite, not staged.
-
----
-
-## What's in the game
-
-- **Deterministic tactics** — seeded PRNG, A\* pathfinding, line-of-sight and cover, damage model,
-  abilities and enemy AI scoring. The same action log always produces the same result.
-- **Stealth and detection** — fog of war, enemy vision cones, alert states, and movement noise that
-  can give you away.
-- **A security network as a real subsystem** — cameras, turrets, cores and network nodes are powered
-  devices with owners. Hijack them and they turn on the guards that relied on them.
-- **Alarm escalation** — noise and gunfire raise the alert level; silenced actions keep the board
-  covert.
-- **Three missions with authored win conditions**, plus a replay viewer.
-- **A leaderboard that verifies** — `/api/submit` re-runs the submitted action log against the *same*
-  simulation package and rejects anything that does not reproduce the claimed outcome.
-- **Saves with migration** — versioned save format with an explicit migration path.
-
-## Controls
+## Playing it
+Everything is reachable with the mouse alone — keyboard shortcuts exist as optional accelerators.
 
 | Input | Action |
 | --- | --- |
-| Click an operative | Select it |
-| Click an enemy | Shoot |
-| Click the ground | Move |
-| `Tab` | Next operative |
-| `Enter` | End turn |
-| Drag / wheel / `Q` `E` / `R` | Pan, zoom, rotate, reset camera |
-| `Esc` | Cancel a pending action |
+| Left click | Select an operative, move onto a highlighted tile, or click a highlighted target to act |
+| Hover a piece | Glows its outline and highlights its maximum move range (both sides — enemy range is a threat read) |
+| Left drag on the board | **Grab-to-rotate**: the board pivots around a pin at the centre of the screen and the point you grabbed follows the cursor |
+| Right drag | Pan, relative to the current view at every rotation angle |
+| Hover an ability | Highlights the tiles it can legally affect; click a targeted ability to **arm** it |
+| Cancel (Esc) | Clear an armed ability or a pending action |
+| Mouse wheel / camera dock | Zoom, rotate in 90° steps, reset view |
 
-The HUD states the current objective, the room, the phase and the turn, and shows optional
-challenges separately from required progress.
+The top-right panel has two tabs: a **Commentary** feed of the running turn history, and **Objectives**
+(objectives plus squad status). Selecting an operative plays its own robotic line (*"<unit> at your
+service"*). Ability use renders a travelling flight path with a trail and an impact beat.
 
----
+## Architecture (separation that enables headless testing)
+- `packages/sim` (`@sb/sim`) — authoritative simulation: PRNG, map, A* pathfinding, LOS + cover,
+  deterministic combat, abilities, enemy AI (scoring), turn system, replay, save, scoring, replay
+  validation. No DOM/Three. Testable in browser + Node + Vitest.
+- `packages/server` (`@sb/server`) — Node HTTP + SQLite leaderboard + `/api/submit` (server replays
+  the action log with the SAME sim package; only validated runs are stored) + `/api/leaderboard`.
+- `packages/web` (`@sb/web`) — Vite + React + Three.js (direct). Camera, lighting/shadows/fog/bloom,
+  procedural unit/tile geometry, particles, screen shake, HUD, menus, replay viewer, audio, debug.
 
-## Architecture
+Determinism invariants: rules never call `Math.random()`; the renderer never feeds rules; the
+server and browser share one sim. Replays re-run the action log, not a recording.
 
-The separation is what makes the game testable headlessly — the simulation has no idea a renderer
-exists.
+## Run
+- `npm install`
+- `npm run verify` — full verification (typecheck, build, headless tests, browser journeys)
+- `npm run test` — headless (Vitest). `npm run e2e` — Playwright.
+- `npm run serve` — server on :8787 (`SB_DB=./data/lb.sqlite npm run serve` to persist).
+- Dev game: `npm run dev -w @sb/web`.
 
-- **`packages/sim` (`@sb/sim`)** — the authoritative simulation: PRNG, map, A\* pathfinding, LOS and
-  cover, deterministic combat, abilities, enemy AI (scoring), turn system, replay, save, scoring and
-  replay validation. No DOM, no Three.js. Runs in the browser, in Node, and under Vitest.
-- **`packages/server` (`@sb/server`)** — Node HTTP server using the built-in `node:sqlite` (no native
-  dependency): `/api/health`, `/api/submit`, `/api/leaderboard` and the verified match archive. It
-  replays the submitted action log with the **same** `@sb/sim` package, and only stores runs it can
-  reproduce.
-- **`packages/web` (`@sb/web`)** — Vite + React + Three.js: camera rig, lighting, shadows, fog,
-  bloom, ambient occlusion, procedurally generated unit and tile geometry, effects, HUD, menus,
-  briefing, replay viewer and audio.
+## Audio
+Sound effects are 22 curated samples from **Kenney**'s CC0 audio packs (sci-fi, interface, impact and
+UI), and the unit selection lines are robotic speech generated with **flite**. Both are licence-cleared
+for commercial use and redistributable. The exact source packs, their pinned URLs and sha256s, the
+per-event mapping and the generation recipe are recorded in
+[`docs/AUDIO_PROVENANCE.md`](docs/AUDIO_PROVENANCE.md), and `scripts/gen-audio.sh` reproduces the whole
+set — failing closed if a download no longer matches its recorded hash.
 
-### Determinism invariants
+## Determinism hooks (debug, not gameplay shortcuts)
+`window.__sbGame`, `window.__sbHash`, `window.__sbPerf`, `window.__sbReplayRun` drive the real
+simulation for tests. F3 toggles the debug overlay (FPS/draw/tri/seed/turn/rev); default OFF.
 
-- Rules code never calls `Math.random()` — all randomness comes from the seeded PRNG.
-- The renderer never feeds back into the rules.
-- The server and the browser share one simulation package.
-- Replays re-run the action log; they are not recordings.
-
-`scripts/verify-all.sh` is the single verification entry point: typecheck, production build, unit and
-integration tests, then the full browser suite.
-
----
-
-## Run it
-
-```sh
-npm install
-
-npm run verify      # typecheck + build + unit/integration + browser journeys
-npm test            # unit + integration (Vitest)
-npm run e2e         # browser journeys (Playwright)
-npm run typecheck   # tsc --noEmit
-npm run build       # production web build
-
-npm run serve       # leaderboard/archive server on :8787  (SB_PORT to change)
-SB_DB=./data/lb.sqlite npm run serve   # persist the leaderboard
-
-npm run dev -w @sb/web                 # dev server for the game
-```
-
-The browser suite launches its own server and Vite instance, so `npm run e2e` is self-contained.
-
-## Tech
-
-TypeScript · Three.js · React · Vite · Node (`node:sqlite`) · Vitest · Playwright.
-
-## Testing
-
-- **Unit and integration** — Vitest suites for the simulation and the server, including determinism,
-  replay validation, save migration, security-network behaviour and archive integrity.
-- **Browser journeys** — Playwright specs covering the title and deploy flow, fog of war, detection,
-  the security network, missions, the leaderboard round trip, replay, tamper rejection, UI behaviour
-  and the visual criteria for characters and environment.
-
-Several of the browser specs assert against **independent oracles** rather than the display: for
-example the detection spec recomputes the expected telegraph set from authoritative unit state and
-fails on both a missing *and* an invented cone, and the security spec is a two-run contrast that
-changes only a device's authority.
-
-## License
-
-[MIT](LICENSE) — use it, fork it, change it, ship it. Contributions and issues are welcome.
+See `docs/ACCEPTANCE.md` for the acceptance matrix + honest limitations.

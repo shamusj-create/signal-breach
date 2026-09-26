@@ -1,4 +1,4 @@
-import type { GameState, PlayerAction, Position, UnitState, AbilityId } from "@sb/sim";
+import type { GameState, PlayerAction, Position, UnitState, AbilityId, GameEvents } from "@sb/sim";
 import {
   createInitialState,
   missionByIndex,
@@ -9,16 +9,30 @@ import {
   autoSolve,
   serializeGame,
   deserializeGame,
+  ABILITIES,
 } from "@sb/sim";
 import { World } from "../scene/World.ts";
 import { Store, type Snapshot } from "./serialize.ts";
-import { playSfx } from "../audio.ts";
+import { playSfx, playVoice } from "../audio.ts";
+import { legalTargetsFor } from "./targeting.ts";
 
 export type SnapshotStore = Store<Snapshot>;
 
 function posKey(p: Position): string {
   return `${p.x},${p.y}`;
 }
+
+// Left-drag grab-to-rotate + click-vs-drag tuning. A left gesture that moves more than CLICK_DRAG_PX
+// becomes a continuous orbit (the azimuth follows the drag through intermediate angles, no quarter snap);
+// under that threshold it stays a plain click, which now resolves on pointer-UP (never on DOWN), so a
+// click preceded by a drag cannot double-fire a selection/move/attack. Instead of the old horizontal-only
+// delta, the azimuth follows the pointer's ANGLE about the screen-centre pivot (the point you grabbed
+// follows the cursor); GRAB_ROT_SIGN/GAIN were tuned by measuring the subject's angular change against
+// the pointer's, and a straight pass within GRAB_PIVOT_DEGEN px of the pivot is a degenerate no-op.
+const CLICK_DRAG_PX = 8;
+const GRAB_PIVOT_DEGEN = 20;
+const GRAB_ROT_SIGN = 1;
+const GRAB_ROT_GAIN = 1.0;
 
 export class TacticalGame {
   state: GameState;
@@ -28,7 +42,12 @@ export class TacticalGame {
   actionLog: PlayerAction[] = [];
   selected: string | null = null;
   private down = false;
-  private panning = false;
+  // Drag mode for the CURRENT pressed gesture: "pan" (right / shift / space), "orbit" (left past the
+  // click threshold), or "click" (left, still under the threshold → resolves to a pick on pointer-up).
+  private drag: "pan" | "orbit" | "click" = "click";
+  private spacePan = false;
+  private startX = 0;
+  private startY = 0;
   private lastX = 0;
   private lastY = 0;
   private moveRange = new Set<string>();
@@ -36,6 +55,23 @@ export class TacticalGame {
   // changes (presentation-only diff of authoritative device state; never read for rules).
   private prevDev = new Map<string, string>();
   private stateListeners = new Set<(g: TacticalGame) => void>();
+  // Presentation-only hover state: the piece currently highlighted by the cursor (any side) and the
+  // last action's per-unit travelled-tile paths (authoritative, for tests). Never a rule source.
+  private hovered: string | null = null;
+  private lastMovePaths = new Map<string, string[]>();
+  // Ability-targeting presentation state (presentation-only; never feeds rules back).
+  // - `preview` = the legal-target set currently shown because an ability is being HOVERED.
+  // - `armed` = a targeted ability that has been CLICKED and is awaiting a target click. When set,
+  //   its highlight persists and the next click on a highlighted target fires the ability.
+  // Both hold an independently computed legal set (derived from sim state + the ability's range/kind).
+  flightEnabled = true;
+  preview: { unitId: string; ability: string; keys: string[]; kind: "units" | "devices" | "none" } | null = null;
+  armed: { unitId: string; ability: string; keys: string[]; kind: "units" | "devices" | "none" } | null = null;
+  // Running commentary: plain-language lines derived from the authoritative event stream, kept in
+  // chronological order (newest pushed last). Presentation-only; never a rule source; no state is
+  // read back from it. Capped so the scrollback is bounded but still lets a player read back.
+  feed: { seq: number; text: string }[] = [];
+  private feedSeq = 0;
 
   constructor(_container: HTMLElement, world: World, store: SnapshotStore, missionIndex: number, seed: number) {
     this.world = world;
@@ -44,6 +80,7 @@ export class TacticalGame {
     this.state = createInitialState(missionByIndex(missionIndex), seed);
     this.world.buildBoard(this.state.tiles, { hazard: [] });
     this.world.buildProps(this.state.devices, this.state.extraction);
+    this.pushFeed("Squad inserted. Turn 1 — your move.");
     this.sync();
     this.attachInput();
   }
@@ -72,6 +109,7 @@ export class TacticalGame {
       gameOver: s.gameOver,
       victory: s.victory,
       enemyBusy: false,
+      feed: this.feed.slice(-160),
     };
   }
 
@@ -155,7 +193,48 @@ export class TacticalGame {
     this.sync();
   }
 
-  private act(action: PlayerAction) {
+  // Build last-move trails from the AUTHORITATIVE move-event stream. Each "move" event carries the
+  // real travelled tiles (path); we REPLACE that unit's trail (never append), so a piece keeps only
+  // its most recent move's trail, separate per piece, and it never accumulates across turns. Reads
+  // only event data; mutates no state. Presentation-only.
+  private recordMoveHistory(events: { kind: string; data: Record<string, unknown> }[]) {
+    const paths = new Map<string, string[]>();
+    for (const e of events) {
+      if (e.kind !== "move") continue;
+      const unitId = e.data.unitId as string | undefined;
+      const path = e.data.path as { x: number; y: number }[] | undefined;
+      if (!unitId || !path || path.length === 0) continue;
+      const tiles = path.map((p) => ({ x: p.x, y: p.y }));
+      this.world.setTrail(unitId, tiles);
+      paths.set(unitId, tiles.map((t) => `${t.x},${t.y}`));
+    }
+    this.lastMovePaths = paths;
+  }
+
+  // Compute a piece's max-move highlight from authoritative state and paint it (outline + range).
+  // Uses the same reachableCells rule the pointer path uses, so the highlight equals the reachable
+  // set. Works for either side (enemies included). Presentation-only; no state mutation.
+  private applyHover(unitId: string) {
+    const unit = this.state.units.find((u) => u.id === unitId && u.alive);
+    if (!unit) {
+      this.world.clearHover();
+      return;
+    }
+    const reach = reachableCells(this.state, unit);
+    const keys: string[] = [];
+    for (const k of reach.keys()) {
+      const [xs, ys] = k.split(",");
+      if (Number(xs) === unit.pos.x && Number(ys) === unit.pos.y) continue; // its own tile is not a target
+      keys.push(k);
+    }
+    const at = this.world.tileToWorld({ x: unit.pos.x, y: unit.pos.y, h: unit.pos.h });
+    this.world.setHover(unit.id, { x: at.x, y: at.y, z: at.z }, keys);
+  }
+
+private act(action: PlayerAction) {
+    const before = this.state;
+    // A committed action supersedes any pending preview/arming highlight (presentation-only).
+    this.clearAbilityHighlight();
     const res = applyAction(this.state, action);
     if (res.error) {
       playSfx("deny");
@@ -163,30 +242,36 @@ export class TacticalGame {
     }
     this.state = res.state;
     this.actionLog.push(action);
-    // Weapon-fire VFX for a directed attack: muzzle at the shooter + a tracer on the REAL line
-    // (shooter tile -> target tile), positioned from authoritative geometry. If the round reached no
-    // unit it is treated as intercepted — it sprays the intervening cover/deck instead of a unit.
+    this.feedForPlayerAction(action, res.events, before);
+    this.feedObjectives(before);
+    // Last-move trail history is drawn from the AUTHORITATIVE event stream (covers player moves and
+    // the enemy phase in one place). Replace-only, per piece. Hover highlight is stale once the
+    // board changes, so clear it here (a fresh pointermove / debugHover re-establishes it).
+    this.recordMoveHistory(res.events);
+    this.world.clearHover();
+    this.hovered = null;
+    if (action.kind === "move") this.world.beginMove(action.unitId, action.path);
+    // Recoil/flare pose on the shooter for a directed attack. The FLIGHT PATH itself is driven from
+    // the authoritative event stream below (replayVfx -> "shot"), NOT a parallel inline effect, so
+    // the same geometry-driven path renders for player AND enemy fire. Rules are never read here.
     if (action.kind === "attack") {
       const attacker = this.state.units.find((u) => u.id === action.unitId);
-      const target = action.targetUnitId ? this.state.units.find((u) => u.id === action.targetUnitId) : undefined;
-      playSfx("shot");
-      if (attacker && target) {
-        this.world.fire({ ...attacker.pos }, { ...target.pos });
-        this.world.pose(target.id, "hit");
-        const reached = res.events.some((e) => e.kind === "damage" && (e.data as { unitId?: string }).unitId === target.id);
-        if (!reached) this.deckOrCoverImpact(attacker.pos, target.pos);
-      } else if (attacker && action.targetPos) {
-        this.world.fire({ ...attacker.pos }, { ...action.targetPos });
-      }
-      this.world.pose(action.unitId, "fire");
+      if (attacker) this.world.pose(action.unitId, "fire");
     }
-    // Presentation-only reaction to the AUTHORITATIVE event stream (rules untouched): hits scale
-    // their burst, reactions/turret fire get their own muzzle + tracer, deaths a restrained
-    // dissipate, and ability/hack events drive EMP / shimmer / sweep / device sparks.
+    // Presentation-only reaction to the AUTHORITATIVE event stream (rules untouched): shots become a
+    // travelling flight path, hits scale their burst, deaths a restrained dissipate, and ability/hack
+    // events drive EMP / shimmer / sweep / device sparks.
     this.replayVfx(res.events);
     this.world.clearMarkers();
     this.select(this.selected); // refresh markers for the surviving/active unit
     this.sync();
+  }
+
+  // Drop the preview/armed ability-target highlight (presentation-only). Clears nothing in rules.
+  private clearAbilityHighlight(): void {
+    this.preview = null;
+    this.armed = null;
+    this.world.clearAbilityTargets();
   }
 
   // Drive combat/ability/device VFX from the authoritative event stream + real tile geometry. Reads
@@ -194,7 +279,16 @@ export class TacticalGame {
   private replayVfx(events: { kind: string; data: Record<string, unknown> }[]) {
     const S = this.state;
     for (const e of events) {
-      if (e.kind === "damage") {
+      if (e.kind === "shot") {
+        // A travelling projectile for ANY ranged shot, from the authoritative shooter->target tiles.
+        // Works for both sides; reduced-motion resolves instantly inside World.flight (no travel).
+        const from = e.data.from as number[];
+        const to = e.data.to as number[];
+        if (from && to) {
+          this.world.flight({ x: from[0], y: from[1], h: 0 }, { x: to[0], y: to[1], h: 0 });
+          playSfx("shot");
+        }
+      } else if (e.kind === "damage") {
         const id = (e.data.unitId as string) ?? undefined;
         const amount = (e.data.amount as number) ?? 1;
         const u = S.units.find((x) => x.id === id);
@@ -204,11 +298,11 @@ export class TacticalGame {
       } else if (e.kind === "reaction") {
         const by = S.units.find((x) => x.id === (e.data.by as string));
         const on = S.units.find((x) => x.id === (e.data.on as string));
-        if (by && on) { this.world.fire({ ...by.pos }, { ...on.pos }, 0xff9a3c); playSfx("shot"); }
+        if (by && on) { this.world.flight({ ...by.pos }, { ...on.pos }, 0xff9a3c); playSfx("shot"); }
       } else if (e.kind === "turret_fire") {
         const dev = S.devices.find((x) => x.id === (e.data.deviceId as string));
         const on = S.units.find((x) => x.id === (e.data.target as string));
-        if (dev && on) { this.world.fire({ x: dev.x, y: dev.y, h: 0 }, { ...on.pos }, 0xff9a3c); playSfx("shot"); }
+        if (dev && on) { this.world.flight({ x: dev.x, y: dev.y, h: 0 }, { ...on.pos }, 0xff9a3c); playSfx("shot"); }
       } else if (e.kind === "death") {
         const u = S.units.find((x) => x.id === (e.data.unitId as string));
         if (u) this.world.neutralize({ ...u.pos });
@@ -299,6 +393,9 @@ export class TacticalGame {
 
   // ---- selection / markers ----
   select(id: string | null) {
+    // Changing (or dropping) the selection cancels any armed ability + pending target preview, so the
+    // armed highlight never bleeds across a new selection ("cancel by selecting something else").
+    this.clearAbilityHighlight();
     this.selected = id && this.state.units.find((u) => u.id === id && u.alive && u.side === "player") ? id : null;
     this.world.clearMarkers();
     if (this.selected) {
@@ -308,6 +405,8 @@ export class TacticalGame {
       this.moveRange = new Set(reach.keys());
       this.world.showRange(this.moveRange, 0x2bd7ff);
       playSfx("select");
+      // Robotic voice line, distinct per operative, keyed on the unit's LIVE name (not a lookup).
+      playVoice(u.name);
     } else {
       this.moveRange = new Set();
     }
@@ -323,6 +422,7 @@ export class TacticalGame {
     window.addEventListener("pointermove", this.onMove);
     el.addEventListener("wheel", this.onWheel, { passive: false });
     window.addEventListener("keydown", this.onKey);
+    window.addEventListener("keyup", this.onKeyUp);
   }
 
   detachInput() {
@@ -333,29 +433,80 @@ export class TacticalGame {
     window.removeEventListener("pointermove", this.onMove);
     el.removeEventListener("wheel", this.onWheel);
     window.removeEventListener("keydown", this.onKey);
+    window.removeEventListener("keyup", this.onKeyUp);
   }
 
   private onDown = (e: PointerEvent) => {
     this.down = true;
-    this.panning = e.button === 2 || e.shiftKey;
+    this.startX = e.clientX;
+    this.startY = e.clientY;
     this.lastX = e.clientX;
     this.lastY = e.clientY;
-    if (!this.panning) this.onClick(e.clientX, e.clientY);
+    // Right-drag / Shift-drag / Space-drag pan; a plain left-drag is a candidate orbit (and a plain
+    // left press+release is a click, decided on pointer-up). NO pick fires on pointer-DOWN, so a
+    // left-drag cannot also select/move/attack.
+    this.drag = e.button === 2 || e.shiftKey || this.spacePan ? "pan" : "click";
   };
 
-  private onUp = () => {
+  private onUp = (e: PointerEvent) => {
+    // A left gesture that never crossed the drag threshold is a genuine click → do the pick HERE
+    // (using the release position) instead of on pointer-down. A drag (orbit) never picks.
+    if (this.drag === "click") this.onClick(e.clientX, e.clientY);
     this.down = false;
-    this.panning = false;
+    this.drag = "click";
   };
 
   private onMove = (e: PointerEvent) => {
-    if (!this.down || !this.panning) return;
-    const dx = e.clientX - this.lastX;
-    const dy = e.clientY - this.lastY;
-    this.lastX = e.clientX;
-    this.lastY = e.clientY;
-    const f = 0.02 * this.world.zoom;
-    this.world.pan(-dx * f, -dy * f);
+    if (this.down) {
+      if (this.drag === "click") {
+        // Under the threshold → still a potential click (no orbit). Past it → become a continuous orbit.
+        if (Math.abs(e.clientX - this.startX) + Math.abs(e.clientY - this.startY) < CLICK_DRAG_PX) return;
+        this.drag = "orbit";
+      }
+      const px = this.lastX;
+      const py = this.lastY;
+      this.lastX = e.clientX;
+      this.lastY = e.clientY;
+      const dx = e.clientX - px;
+      const dy = e.clientY - py;
+      if (this.drag === "pan") {
+        // Screen-space pan: right-drag slides the world screen-right, down-drag slides it screen-down,
+        // at every orbit angle (the shared view-relative basis in World.pan).
+        const f = 0.02 * this.world.zoom;
+        this.world.pan(dx * f, dy * f);
+        return;
+      }
+      // Left-drag grab-to-rotate: yaw the board about the screen-centre pivot by the pointer's CHANGE OF
+      // ANGLE about that pivot (atan2), so the grabbed point follows the cursor. Both axes matter — a
+      // vertical drag across the pin rotates, while a straight pass THROUGH the pin is degenerate (both
+      // endpoints within GRAB_PIVOT_DEGEN px of the pivot) and is treated as a no-op. Sign/gain tuned so
+      // the subject's angular change matches the pointer's in sign and is close in magnitude.
+      const rect = this.world.renderer.domElement.getBoundingClientRect();
+      const cx = rect.left + rect.width / 2;
+      const cy = rect.top + rect.height / 2;
+      const r0 = Math.hypot(px - cx, py - cy);
+      const r1 = Math.hypot(e.clientX - cx, e.clientY - cy);
+      if (r0 >= GRAB_PIVOT_DEGEN && r1 >= GRAB_PIVOT_DEGEN) {
+        const a0 = Math.atan2(py - cy, px - cx);
+        const a1 = Math.atan2(e.clientY - cy, e.clientX - cx);
+        let dAng = a1 - a0;
+        if (dAng > Math.PI) dAng -= Math.PI * 2;
+        else if (dAng < -Math.PI) dAng += Math.PI * 2;
+        // 4 quarter-turns span 2π, so quarter-turns per radian is 2/π.
+        this.world.orbitBy(GRAB_ROT_SIGN * (dAng * (2 / Math.PI)) * GRAB_ROT_GAIN);
+      }
+      return;
+    }
+    // Not dragging → this is a hover. Highlight the piece (any side) under the cursor so the board
+    // reads as selectable / a threat, and show its max move range. Recompute only when the hovered
+    // piece changes (cheap + stable); clears when the cursor leaves a piece.
+    const tile = this.world.pickAt(e.clientX, e.clientY);
+    const unit = tile ? this.state.units.find((u) => u.alive && u.pos.x === tile.x && u.pos.y === tile.y) : undefined;
+    const id = unit ? unit.id : null;
+    if (id === this.hovered) return;
+    this.hovered = id;
+    if (unit) this.applyHover(unit.id);
+    else this.world.clearHover();
   };
 
   private onWheel = (e: WheelEvent) => {
@@ -391,9 +542,13 @@ export class TacticalGame {
         break;
       case " ":
         e.preventDefault();
-        this.panning = true;
+        this.spacePan = true; // hold Space (+ left-drag) to pan; released in onKeyUp
         break;
     }
+  };
+
+  private onKeyUp = (e: KeyboardEvent) => {
+    if (e.key === " ") this.spacePan = false;
   };
 
   cycleUnit() {
@@ -402,13 +557,32 @@ export class TacticalGame {
     const idx = alive.findIndex((u) => u.id === this.selected);
     const next = alive[(idx + 1) % alive.length];
     this.select(next.id);
-    this.world.focusTile(next.pos.x, next.pos.y);
+    // Framing contract: selecting a unit must NOT retarget the camera onto that unit. The old
+    // focusTile lurch dropped the playfield to a corner and left roughly half the frame as empty
+    // backdrop. The selected operative is communicated by its reticle + HUD card + a guidance toast,
+    // so the camera keeps the whole board centred and dominant.
   }
 
   private onClick(clientX: number, clientY: number) {
     if (this.state.phase !== "player" || this.state.gameOver) return;
     const tile = this.world.pickAt(clientX, clientY);
     if (!tile) return;
+    this.clickAtTile(tile);
+  }
+
+  // The tile-level resolution of a board click, shared by the pointer path and the deterministic test
+  // hook. An armed ability resolves on a highlighted target and cancels on any other click.
+  private clickAtTile(tile: { x: number; y: number }): void {
+    if (this.state.phase !== "player" || this.state.gameOver) return;
+    const key = posKey({ x: tile.x, y: tile.y, h: 0 });
+    if (this.armed) {
+      if (!this.armed.keys.includes(key)) {
+        this.cancelArmed();
+        return;
+      }
+      this.fireArmed(tile);
+      return;
+    }
     const enemy = this.unitAt(tile.x, tile.y);
     const sel = this.selectedUnit();
     if (sel) {
@@ -416,8 +590,8 @@ export class TacticalGame {
         this.tryAttack(sel.id, enemy);
         return;
       }
-      const key = posKey({ x: tile.x, y: tile.y, h: 0 });
-      if (!enemy && this.moveRange.has(key)) {
+      const moveKey = posKey({ x: tile.x, y: tile.y, h: 0 });
+      if (!enemy && this.moveRange.has(moveKey)) {
         this.tryMove(sel, tile);
         return;
       }
@@ -425,9 +599,48 @@ export class TacticalGame {
     const ally = this.unitAt(tile.x, tile.y);
     if (ally && ally.side === "player") {
       this.select(ally.id);
-      this.world.focusTile(ally.pos.x, ally.pos.y);
     } else {
       this.select(null);
+    }
+  }
+
+  // Deterministic hook: resolve a board click at a tile exactly as the pointer path would.
+  debugClickTile(x: number, y: number) {
+    this.clickAtTile({ x, y });
+  }
+
+  // ---- FLIGHT test readouts (presentation-only; never a rule source) -------------------------
+  // The live projectiles with their world head positions + the real source/target tiles, so the spec
+  // can project screen positions across frames and derive start/end/impact from camera geometry.
+  debugProjectiles() {
+    return this.world.debugProjectiles();
+  }
+
+  // Presentation-only: run the SAME event->flight pipeline combat uses for an arbitrary real line
+  // (e.g. an enemy->player shot), so the spec proves the flight path is wired for BOTH sides without
+  // depending on RNG. Feeds the identical replayVfx path a real shot event would, no state change.
+  debugShotLine(from: { x: number; y: number }, to: { x: number; y: number }) {
+    this.replayVfx([{ kind: "shot", data: { from: [from.x, from.y], to: [to.x, to.y] } }]);
+  }
+
+  // Resolve the armed ability on a highlighted target tile. Dispatches through the SAME action path a
+  // keyboard/HUD action would, so the browser journey exercises the authoritative simulation.
+  private fireArmed(tile: { x: number; y: number }): void {
+    const armed = this.armed;
+    if (!armed) return;
+    const def = ABILITIES[armed.ability as keyof typeof ABILITIES];
+    const target = this.state.units.find((u) => u.alive && u.pos.x === tile.x && u.pos.y === tile.y);
+    this.clearAbilityHighlight();
+    if (def && def.kind === "attack") {
+      if (target) {
+        this.act({ kind: "attack", unitId: armed.unitId, ability: armed.ability as AbilityId, targetUnitId: target.id });
+      } else {
+        this.act({ kind: "attack", unitId: armed.unitId, ability: armed.ability as AbilityId, targetPos: { x: tile.x, y: tile.y, h: 0 } });
+      }
+    } else if (target) {
+      this.act({ kind: "ability", unitId: armed.unitId, ability: armed.ability as AbilityId, targetUnitId: target.id });
+    } else {
+      this.act({ kind: "ability", unitId: armed.unitId, ability: armed.ability as AbilityId, targetPos: { x: tile.x, y: tile.y, h: 0 } });
     }
   }
 
@@ -459,32 +672,231 @@ export class TacticalGame {
     this.act({ kind: "attack", unitId: attackerId, ability: attacker.defaultAttack, targetUnitId: target.id });
   }
 
+  // Presentation-only hover preview for an ability button (index into the selected unit's abilities).
+  // Hovering shows the authoritative legal target set for that ability; unhover clears it. An ARMED
+  // highlight is never overwritten by a plain hover (arming persists until used or cancelled).
+  hoverAbility(i: number) {
+    const sel = this.selectedUnit();
+    if (!sel || this.state.phase !== "player" || this.armed) {
+      this.clearAbilityHighlight();
+      return;
+    }
+    const ability = sel.abilities[i];
+    if (!ability) {
+      this.clearAbilityHighlight();
+      return;
+    }
+    const t = legalTargetsFor(this.state, sel, ability);
+    this.preview = { unitId: sel.id, ability, keys: t.keys, kind: t.kind };
+    this.world.setAbilityTargets(t.keys);
+  }
+
+  unhoverAbility() {
+    if (this.armed) return;
+    this.preview = null;
+    this.world.clearAbilityTargets();
+  }
+
   abilityByIndex(i: number) {
     const sel = this.selectedUnit();
     if (!sel || this.state.phase !== "player" || this.state.gameOver) return;
     const ability = sel.abilities[i];
     if (!ability) return;
+    // Re-clicking the already-armed ability cancels the arm.
+    if (this.armed && this.armed.ability === ability) {
+      this.cancelArmed();
+      return;
+    }
+    // Self / support abilities that need no target click still act immediately.
     if (ability === "cloak" || ability === "barrier" || ability === "overwatch") {
       playSfx("click");
       this.act({ kind: "ability", unitId: sel.id, ability });
       return;
     }
-    // targeted abilities need a hovered/last target; default to self/no-op for the demo build
-    playSfx("deny");
+    // A targeted ability: ARM it. The legal target set stays highlighted; the next click on a
+    // highlighted target fires it, or Cancel/Esc (or selecting something else) cancels the arm.
+    const t = legalTargetsFor(this.state, sel, ability);
+    if (t.keys.length === 0) {
+      playSfx("deny");
+      return;
+    }
+    this.armed = { unitId: sel.id, ability, keys: t.keys, kind: t.kind };
+    this.preview = null;
+    this.world.setAbilityTargets(t.keys, 0xff3a2c);
+    playSfx("click");
+  }
+
+  cancelArmed(): void {
+    if (this.armed) playSfx("deny");
+    this.clearAbilityHighlight();
+  }
+
+  // Deterministic test hooks (drive the SAME hover/arm path a real pointer/HUD interaction uses).
+  debugHoverAbility(i: number) { this.hoverAbility(i); }
+  debugUnhoverAbility() { this.unhoverAbility(); }
+  debugArmAbility(i: number) { this.abilityByIndex(i); }
+  debugArmed(): { ability: string; keys: string[] } | null {
+    return this.armed ? { ability: this.armed.ability, keys: [...this.armed.keys] } : null;
+  }
+
+  // Deterministic test hook: paint a preview of an ability's legal target set WITHOUT mutating rules,
+  // from an arbitrary attacker + ability, so the TARGETS spec can compare the render against a set it
+  // computed independently. Presentation-only.
+  debugPreviewTargets(unitId: string, ability: string) {
+    const unit = this.state.units.find((u) => u.id === unitId && u.alive);
+    if (!unit) return [];
+    const t = legalTargetsFor(this.state, unit, ability);
+    this.preview = { unitId, ability, keys: t.keys, kind: t.kind };
+    this.world.setAbilityTargets(t.keys);
+    return t.keys;
+  }
+
+  debugClearPreview() {
+    this.clearAbilityHighlight();
   }
 
   endTurn() {
     if (this.state.phase !== "player" || this.state.gameOver) return;
+    const beforeState = this.state;
     this.select(null);
     const snap = this.snapshot();
     this.store.set({ ...snap, enemyBusy: true });
     // The entire enemy phase resolves inside one deterministic sim call (no async phase to stall).
+    const turnNo = this.state.turn;
+    this.pushFeed(`Enemy phase (Turn ${turnNo}).`);
     const res = applyAction(this.state, { kind: "endTurn" });
     this.state = res.state;
     this.actionLog.push({ kind: "endTurn" });
+    this.feedForEnemyPhase(res.events, res.state);
+    this.feedObjectives(beforeState);
+    // The whole enemy phase resolves in the one applyAction above; build every moving enemy's
+    // last-move trail from the same authoritative event stream, then drop the stale hover highlight.
+    this.recordMoveHistory(res.events);
+    this.world.clearHover();
+    this.hovered = null;
     this.replayVfx(res.events.slice(0, 80));
     playSfx("click");
     this.sync();
+  }
+
+  // ---- camera + action affordances for mouse-only play (keyboard shortcuts are kept too) ----
+  rotateCam(dir: number) {
+    this.world.rotateQuarter(dir);
+  }
+
+  resetCam() {
+    this.world.setAngle(0);
+    this.world.zoom = 1;
+    this.world.focus.set(0, 0, 0);
+  }
+
+  zoomCam(delta: number) {
+    this.world.zoomBy(delta);
+  }
+
+  panCam(dx: number, dy: number) {
+    this.world.pan(dx, dy);
+  }
+
+  cancelAction() {
+    this.select(null);
+  }
+
+  // ---- running commentary feed (plain language, derived from the authoritative event stream) ----
+  private unitName(state: GameState, id?: string): string {
+    const u = state.units.find((x) => x.id === id);
+    return u ? u.name : "A unit";
+  }
+
+  private pushFeed(text: string) {
+    this.feed.push({ seq: this.feedSeq++, text });
+    if (this.feed.length > 200) this.feed.shift();
+  }
+
+  private feedForPlayerAction(action: PlayerAction, events: GameEvents[], before: GameState) {
+    const S = this.state;
+    const uid = (action as { unitId?: string }).unitId;
+    const actor = S.units.find((u) => u.id === uid);
+    const actorName = actor ? actor.name : "Operative";
+    if (action.kind === "move") {
+      this.pushFeed(`${actorName} moved.`);
+      for (const e of events) {
+        if (e.kind === "reaction") {
+          this.pushFeed(`${this.unitName(S, e.data.by as string)} fired back at ${this.unitName(S, e.data.on as string)}.`);
+        } else if (e.kind === "turret_fire") {
+          this.pushFeed(`A turret fired at ${this.unitName(S, e.data.target as string)}.`);
+        }
+      }
+    } else if (action.kind === "attack") {
+      const targetId = action.targetUnitId;
+      let hitFor = 0;
+      for (const e of events) {
+        if (e.kind === "damage" && (e.data.unitId as string) === targetId) hitFor += (e.data.amount as number) ?? 0;
+      }
+      this.pushFeed(`${actorName} shot at ${this.unitName(S, targetId)}. ${hitFor > 0 ? "Hit for " + hitFor + " damage." : "No effect."}`);
+    } else if (action.kind === "ability") {
+      this.pushFeed(`${actorName} used ${abilityWord(action.ability)}.`);
+      for (const e of events) {
+        if (e.kind === "hack") {
+          const dev = S.devices.find((d) => d.id === (e.data.deviceId as string));
+          if (dev) this.pushFeed(`${deviceWord(dev.kind)} disabled.`);
+        }
+      }
+    }
+    const aBefore = before.alert;
+    const aAfter = S.alert;
+    if (aAfter > aBefore) this.pushFeed("The alarm rises.");
+    else if (aAfter < aBefore) this.pushFeed("The alarm eases.");
+  }
+
+  private feedForEnemyPhase(events: GameEvents[], after: GameState) {
+    for (const e of events) {
+      if (e.kind === "move") {
+        this.pushFeed(`${this.unitName(after, e.data.unitId as string)} moved.`);
+      } else if (e.kind === "damage") {
+        const on = after.units.find((x) => x.id === (e.data.unitId as string));
+        if (on && on.side === "player") {
+          this.pushFeed(`${on.name} was hit for ${(e.data.amount as number) ?? 1}.`);
+        }
+      } else if (e.kind === "turret_fire") {
+        this.pushFeed(`A turret fired at ${this.unitName(after, e.data.target as string)}.`);
+      } else if (e.kind === "death") {
+        this.pushFeed(`${this.unitName(after, e.data.unitId as string)} went down.`);
+      }
+    }
+    this.pushFeed(`Your phase (Turn ${after.turn}).`);
+  }
+
+  // Player-facing objective-progress lines, derived by diffing the AUTHORITATIVE objective statuses
+  // (and the victory flag) between the pre-action snapshot and the current state. Emitted whenever an
+  // objective actually changes — a relay is captured, both relays are down (the Core opens), the Core
+  // is breached (Extraction opens), or the squad reaches Extraction. Plain language only; presentation
+  // channel; never a rule source and no state is read back from it.
+  private feedObjectives(before: GameState) {
+    const after = this.state;
+    const isRelay = (id: string) => id === "relay_a" || id === "relay_b";
+    const doneRelays = (s: GameState) => s.objectives.filter((o) => isRelay(o.id) && o.status === "done").length;
+    const rBefore = doneRelays(before);
+    const rAfter = doneRelays(after);
+    if (rAfter > rBefore) {
+      if (rAfter >= 2) {
+        this.pushFeed("Both relays hacked — the Core is open.");
+      } else {
+        const newly = after.objectives.find(
+          (o) => isRelay(o.id) && o.status === "done" && before.objectives.find((b) => b.id === o.id)?.status !== "done",
+        );
+        const name = newly ? newly.label : "A relay";
+        this.pushFeed(`${name} hacked — ${rAfter} of 2 relays.`);
+      }
+    }
+    const coreAfter = after.objectives.find((o) => o.id === "core");
+    const coreBefore = before.objectives.find((o) => o.id === "core");
+    if (coreAfter && coreAfter.status === "done" && (!coreBefore || coreBefore.status !== "done")) {
+      this.pushFeed("Core breached — Extraction is open.");
+    }
+    if (after.victory && !before.victory) {
+      this.pushFeed("Extraction reached — mission complete.");
+    }
   }
 
   // ---- deterministic test/debug API (also used by the debug overlay) ----
@@ -505,6 +917,30 @@ export class TacticalGame {
     playSfx("move");
     this.act({ kind: "move", unitId, path });
     return { ok: true };
+  }
+
+  // Test/sampling helper: choose the longest legal multi-step path a living player unit can take
+  // right now, reconstructed from the same authoritative reach the pointer path uses. Does NOT move.
+  debugFarthestPath(unitId: string): { ok: boolean; from?: Position; to?: Position; path?: Position[]; len?: number } {
+    const unit = this.state.units.find((u) => u.id === unitId && u.alive);
+    if (!unit) return { ok: false };
+    const reach = reachableCells(this.state, unit);
+    const fromKey = `${unit.pos.x},${unit.pos.y}`;
+    let bestKey: string | null = null;
+    let bestLen = 0;
+    for (const k of reach.keys()) {
+      if (k === fromKey) continue;
+      const path = reconstructPathFromReach(reach, k);
+      if (path.length > bestLen) {
+        bestLen = path.length;
+        bestKey = k;
+      }
+    }
+    if (!bestKey || bestLen < 2) return { ok: false };
+    const path = reconstructPathFromReach(reach, bestKey);
+    const parts = bestKey.split(",");
+    const to: Position = { x: Number(parts[0]), y: Number(parts[1]), h: 0 };
+    return { ok: true, from: { ...unit.pos }, to, path, len: path.length };
   }
 
   debugAttack(unitId: string, targetId: string) {
@@ -543,6 +979,36 @@ export class TacticalGame {
 
   debugState() {
     return this.state;
+  }
+
+  // Test hooks: read/drive the presentation-only hover + trail state deterministically. debugHover
+  // routes through the SAME applyHover path a live pointermove uses, so the specs exercise the real
+  // hover code, not a mock. debugLastMovePaths exposes the authoritative travelled tiles from the
+  // most recent action so the specs can verify the drawn trail WITHOUT trusting the renderer.
+  debugHover(unitId: string | null) {
+    if (!unitId) {
+      this.hovered = null;
+      this.world.clearHover();
+      return;
+    }
+    const u = this.state.units.find((x) => x.id === unitId && x.alive);
+    if (!u) {
+      this.hovered = null;
+      this.world.clearHover();
+      return;
+    }
+    this.hovered = unitId;
+    this.applyHover(unitId);
+  }
+
+  debugTrail(): Record<string, string[]> {
+    return this.world.debugTrail();
+  }
+
+  debugLastMovePaths(): Record<string, string[]> {
+    const out: Record<string, string[]> = {};
+    for (const [k, v] of this.lastMovePaths) out[k] = v.slice();
+    return out;
   }
 
   // Deterministic test hook used by Journey A: performs one greedy player action via the SAME
@@ -613,6 +1079,23 @@ export class TacticalGame {
     return { victory: this.state.victory, turn: this.state.turn };
   }
 
+  // Deterministic playthrough used by the COMMENTARY feed evidence: replays the shared solver's
+  // action log through the SAME action path a human/pointer uses (act for move/attack/ability,
+  // endTurn for the phase hand-off), so the running commentary — including objective-progress lines —
+  // is populated from REAL transitions rather than a mock. The reducer trajectory is identical to a
+  // headless replay of the same log; this only adds the presentation/feed side. No rule is read back.
+  debugPlaythroughLogged(): { victory: boolean; turn: number; actions: number } {
+    const { log } = autoSolve(this.state, 60);
+    let n = 0;
+    for (const a of log) {
+      if (this.state.gameOver) break;
+      if (a.kind === "endTurn") this.endTurn();
+      else this.act(a as PlayerAction);
+      n++;
+    }
+    return { victory: this.state.victory, turn: this.state.turn, actions: n };
+  }
+
   debugReplay(log: PlayerAction[]): { ok: boolean; error?: string } {
     let s = this.state;
     for (const a of log) {
@@ -624,5 +1107,52 @@ export class TacticalGame {
     this.state = s;
     this.sync();
     return { ok: true };
+  }
+}
+
+// Plain-language wording for the commentary feed. Keys are internal ids; the OUTPUT is always a
+// player-facing phrase (no raw codes, no test ids), so it can never leak a developer marker.
+function abilityWord(a: AbilityId): string {
+  switch (a) {
+    case "cloak":
+      return "cloak";
+    case "barrier":
+      return "a barrier";
+    case "overwatch":
+      return "overwatch";
+    case "arc_bolt":
+      return "an arc bolt";
+    case "remote_hack":
+      return "a remote hack";
+    case "emp":
+      return "an EMP";
+    case "takedown":
+    case "backstab":
+      return "a takedown";
+    case "silenced_shot":
+      return "a silenced shot";
+    case "dash":
+      return "a dash";
+    case "blink":
+      return "a blink";
+    case "concussion":
+      return "a concussion blast";
+    default:
+      return "an ability";
+  }
+}
+
+function deviceWord(k: string): string {
+  switch (k) {
+    case "turret":
+      return "Auto-Turret";
+    case "camera":
+      return "Camera";
+    case "node":
+      return "Security Node";
+    case "core":
+      return "Core";
+    default:
+      return "Relay Terminal";
   }
 }

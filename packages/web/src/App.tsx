@@ -2,6 +2,7 @@ import { useEffect, useState, useSyncExternalStore } from "react";
 import { ui, setScreen, setAudioSettings } from "./ui.ts";
 import { GameCanvas } from "./GameCanvas.tsx";
 import { HUD } from "./HUD.tsx";
+import { Guidance } from "./Guidance.tsx";
 import { missionByIndex, computeScore, serializeCampaign, deserializeCampaign, type CampaignSave } from "@sb/sim";
 
 const SAVE_KEY = "signal-breach-campaign-v2";
@@ -144,6 +145,7 @@ function GameScreen() {
     <div className="game-shell">
       <GameCanvas mission={u.campaign.mission} seed={u.campaign.seed} reducedMotion={u.audio.reducedMotion} />
       <HUD />
+      <Guidance />
       <ResultGate />
     </div>
   );
@@ -290,19 +292,26 @@ function Upgrade() {
 
 function Leaderboard() {
   const [rows, setRows] = useState<unknown[]>([]);
-  const [status, setStatus] = useState("loading…");
+  // Honest, player-appropriate server status. The raw "(OK)" / "server unavailable" developer
+  // markers are replaced by a stable-hooked status chip so the truth is still visible to players.
+  const [server, setServer] = useState<{ state: "loading" | "connected" | "down"; text: string }>(
+    { state: "loading", text: "Checking…" },
+  );
   useEffect(() => {
     fetch("/api/leaderboard?mission=all")
       .then((r) => r.json())
       .then((d) => {
         setRows(d.rows ?? []);
-        setStatus("OK");
+        setServer({ state: "connected", text: "Connected" });
       })
-      .catch(() => setStatus("server unavailable"));
+      .catch(() => setServer({ state: "down", text: "Server unavailable — no live results" }));
   }, []);
   return (
     <Shell>
-      <div className="title-mark small">LEADERBOARD <span className="muted">({status})</span></div>
+      <div className="lb-header">
+        <span className="title-mark small">LEADERBOARD</span>
+        <span className="server-status" data-testid="server-status" data-state={server.state}>{server.text}</span>
+      </div>
       <div className="lb">
         {rows.length === 0 && <div className="muted">No validated runs yet. Complete a mission and submit.</div>}
         {(rows as { player: string; score: number; mission: number }[]).map((r, i) => (

@@ -215,7 +215,7 @@ function applyMove(state: GameState, unit: UnitState, path: Position[], sprint: 
   const loud = sprint || path.length > 3;
   emitNoise(state, dest.x, dest.y, loud ? 4 : 2, loud ? "sprint" : "move");
   if (loud) noiseAlarm(state, dest.x, dest.y, 4, events);
-  events.push({ kind: "move", data: { unitId: unit.id, to: dest, sprint: loud } });
+  events.push({ kind: "move", data: { unitId: unit.id, to: dest, sprint: loud, path: path.map((p) => ({ x: p.x, y: p.y })) } });
   fireReactions(state, unit, events);
   const tile = state.tiles[dest.y * 14 + dest.x];
   if (tile && tile.terrain === "hazard") {
@@ -267,6 +267,13 @@ export function applyDamage(state: GameState, target: UnitState, amount: number,
   }
 }
 
+// A shot is a VISUAL cue emitted on the renderer channel (the "NEVER feeds back into rules" events
+// channel), carrying the shooter->target tiles so the flight path is derived from geometry for BOTH
+// sides. It mutates no state, consumes no RNG, and changes no timing — it is presentation-only.
+function emitShot(events: GameEvents[], from: Position, to: Position): void {
+  events.push({ kind: "shot", data: { from: [from.x, from.y], to: [to.x, to.y] } });
+}
+
 function deductEnergy(unit: UnitState, cost: number): boolean {
   if (unit.energy < cost) return false;
   unit.energy -= cost;
@@ -312,6 +319,7 @@ export function resolveAttack(state: GameState, attacker: UnitState, ability: st
   const preview = previewDamage(state, attacker, target, base, { ignoreCover });
   if (!preview.valid) return "invalid";
   applyDamage(state, target, preview.finalDamage, ability, events);
+  emitShot(events, attacker.pos, target.pos);
   const quiet = ability === "silenced_shot" || ability === "backstab";
   attacker.facing = facingDelta(attacker, target.pos);
   emitNoise(state, attacker.pos.x, attacker.pos.y, noisePowerOf(ability), ability);
@@ -471,6 +479,7 @@ export function applyAbility(
         if (cheb(unit.pos, targetPos) > def.range) return "out_of_range";
         const dmg = ability === "arc_bolt" ? 4 : ability === "concussion" ? 5 : 3;
         dest.hp -= dmg;
+        emitShot(events, unit.pos, targetPos);
         events.push({ kind: "dest_damage", data: { destId: dest.id, amount: dmg } });
         if (dest.hp <= 0) {
           dest.destroyed = true;
